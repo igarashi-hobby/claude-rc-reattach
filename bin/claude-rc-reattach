@@ -1,0 +1,285 @@
+#!/bin/zsh
+# claude-rc-reattach — アカウント切り替え後、RC 接続中だった会話を新アカウントで復帰させる
+#
+# 仕組み:
+#   Claude Code は実行中セッションの状態を ~/.claude/sessions/<PID>.json に書き出す。
+#   bridgeSessionId フィールドがあるものが Remote Control 接続中のセッション。
+#   save でそれを manifest に記録し、restore で `claude --resume <sessionId>` を
+#   tmux 内に立ち上げ直すことで、新アカウント配下の新しい RC セッションとして再登録する。
+#
+# 検証環境: Claude Code v2.1.220 / macOS
+
+set -u
+set -o pipefail
+
+VERSION="1.0.0"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/claude-rc-reattach"
+MANIFEST="${CLAUDE_RC_MANIFEST:-$STATE_DIR/manifest.tsv}"
+TMUX_SESSION="${CLAUDE_RC_TMUX_SESSION:-rc-restore}"
+SESSIONS_DIR="$HOME/.claude/sessions"
+
+err()  { print -u2 -- "✖ $*"; }
+warn() { print -- "⚠ $*"; }
+info() { print -- "  $*"; }
+ok()   { print -- "✔ $*"; }
+
+need() {
+  command -v "$1" >/dev/null 2>&1 || { err "'$1' が見つかりません。インストールしてください"; exit 1; }
+}
+
+# 実行中の interactive セッションを TSV で列挙する
+#   mode=rc   → RC 接続中（bridgeSessionId あり）のものだけ
+#   mode=open → RC の有無を問わず、生きているものすべて（多重 resume 防止用）
+scan_sessions() {
+  local mode="$1"
+  python3 - "$mode" "$SESSIONS_DIR" <<'PY'
+import glob, json, os, sys
+mode, sessions_dir = sys.argv[1], sys.argv[2]
+for path in sorted(glob.glob(os.path.join(sessions_dir, "*.json"))):
+    try:
+        d = json.load(open(path))
+    except Exception:
+        continue
+    if d.get("kind") != "interactive":
+        continue
+    pid = d.get("pid")
+    if not isinstance(pid, int):
+        continue
+    try:
+        os.kill(pid, 0)  # プロセス生存確認（PID 死亡後に残った古いファイルを除外）
+    except OSError:
+        continue
+    if mode == "rc" and not d.get("bridgeSessionId"):
+        continue
+    sid, cwd = d.get("sessionId"), d.get("cwd")
+    if not sid or not cwd:
+        continue
+    print("\t".join([sid, cwd, d.get("name") or "", str(pid)]))
+PY
+}
+
+# "loggedIn plan email" の3語を返す
+auth_info() {
+  claude auth status 2>/dev/null | python3 -c '
+import sys, json
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    d = {}
+print("yes" if d.get("loggedIn") else "no", d.get("subscriptionType") or "-", d.get("email") or "-")'
+}
+
+# 作業ディレクトリ → ~/.claude/projects/ 配下のディレクトリ名（非英数字を - に置換）
+encode_project_dir() {
+  print -r -- "$1" | sed 's/[^A-Za-z0-9]/-/g'
+}
+
+cmd_list() {
+  need python3
+  local rows
+  rows=$(scan_sessions rc)
+  if [[ -z "$rows" ]]; then
+    info "RC 接続中の会話はありません"
+    return 0
+  fi
+  print -- "RC 接続中の会話（save で保存される対象）:"
+  print -r -- "$rows" | while IFS=$'\t' read -r sid cwd name pid; do
+    print -- "  • ${name:-(無名)}  [$cwd]  session=$sid  pid=$pid"
+  done
+}
+
+cmd_save() {
+  need python3
+  local rows
+  rows=$(scan_sessions rc)
+  if [[ -z "$rows" ]]; then
+    err "RC 接続中の会話が見つかりません。manifest は変更していません"
+    err "（RC 接続中のセッションを開いた状態で実行してください。/rc active がフッターに出ているか確認）"
+    return 1
+  fi
+  mkdir -p "${MANIFEST:h}"
+  local email
+  email=$(auth_info | awk '{print $3}')
+  {
+    print -- "# claude-rc-reattach manifest v1"
+    print -- "# saved_at=$(date '+%Y-%m-%dT%H:%M:%S%z') account=$email"
+    print -r -- "$rows"
+  } > "$MANIFEST"
+  local n
+  n=$(print -r -- "$rows" | wc -l | tr -d ' ')
+  ok "$n 件の会話を保存しました → $MANIFEST"
+  print -r -- "$rows" | while IFS=$'\t' read -r sid cwd name pid; do
+    info "• ${name:-(無名)}  [$cwd]"
+  done
+}
+
+cmd_restore() {
+  local fork=0 dry=0
+  while (( $# )); do
+    case "$1" in
+      --fork)    fork=1 ;;
+      --dry-run) dry=1 ;;
+      *) err "不明なオプション: $1"; return 1 ;;
+    esac
+    shift
+  done
+  need python3
+  need tmux
+  need claude
+
+  if [[ ! -f "$MANIFEST" ]]; then
+    err "manifest がありません: $MANIFEST"
+    err "（アカウント切り替え前に 'claude-rc-reattach save' を実行しておく必要があります）"
+    return 1
+  fi
+
+  local logged plan email
+  read -r logged plan email <<< "$(auth_info)"
+  if [[ "$logged" != "yes" ]]; then
+    err "未ログインです。先に 'claude auth login' を実行してください"
+    return 1
+  fi
+  ok "ログイン中: $email (plan: $plan)"
+  case "$plan" in
+    pro|max|team|enterprise) ;;
+    *) warn "プラン '$plan' で Remote Control が使えるかは不明です（対象: Pro/Max/Team/Enterprise）" ;;
+  esac
+
+  # いま別プロセスで開かれている会話（同じ transcript への多重書き込みを防ぐ）
+  local open_ids
+  open_ids=$(scan_sessions open | cut -f1)
+
+  # 注意: zsh ではループ内で `local` を再宣言すると変数の中身が出力されるため、
+  # ループで使う変数はここでまとめて宣言する
+  local resumed=0 skipped=0
+  local sid cwd name opid label enc transcript win
+  local -a claude_cmd
+  while IFS=$'\t' read -r sid cwd name opid; do
+    [[ -z "$sid" || "$sid" == \#* ]] && continue
+    label="${name:-$sid}"
+
+    if [[ ! -d "$cwd" ]]; then
+      err "$label: 作業ディレクトリが存在しません → skip ($cwd)"
+      (( skipped++ )) || true
+      continue
+    fi
+
+    enc=$(encode_project_dir "$cwd")
+    transcript="$HOME/.claude/projects/$enc/$sid.jsonl"
+    if [[ ! -f "$transcript" ]]; then
+      err "$label: 会話ログが見つかりません → skip ($transcript)"
+      (( skipped++ )) || true
+      continue
+    fi
+
+    claude_cmd=(claude --resume "$sid")
+    if print -r -- "$open_ids" | grep -qx -- "$sid"; then
+      if (( fork )); then
+        claude_cmd+=(--fork-session)
+        info "$label: 元のプロセスが開いたままのため --fork-session で複製として復帰します"
+      else
+        err "$label: この会話は別プロセスで開いたままです → skip（そちらを閉じるか、--fork を付けて実行）"
+        (( skipped++ )) || true
+        continue
+      fi
+    fi
+
+    win="${label//[^A-Za-z0-9_.-]/-}"
+    win="${win[1,30]}"
+    if (( dry )); then
+      ok "[dry-run] $label: tmux '$TMUX_SESSION' で実行 → ${claude_cmd[*]} @ $cwd"
+      (( resumed++ )) || true
+      continue
+    fi
+
+    if ! tmux has-session -t "=$TMUX_SESSION" 2>/dev/null; then
+      tmux new-session -d -s "$TMUX_SESSION" -c "$cwd" -n "$win" "${claude_cmd[*]}" </dev/null
+      # claude が異常終了した場合だけ pane を残す（原因確認用）。未対応の tmux では無視
+      tmux set-option -t "$TMUX_SESSION" remain-on-exit failed 2>/dev/null || true
+    else
+      tmux new-window -t "$TMUX_SESSION" -c "$cwd" -n "$win" "${claude_cmd[*]}" </dev/null
+    fi
+    ok "$label: 復帰しました（tmux window: $win）"
+    (( resumed++ )) || true
+  done < "$MANIFEST"
+
+  print
+  ok "完了: 復帰 $resumed 件 / skip $skipped 件"
+  if (( resumed > 0 && dry == 0 )); then
+    print
+    info "確認方法:"
+    info "  tmux attach -t $TMUX_SESSION     # 各ウィンドウのフッターに /rc active が出ていれば成功"
+    info "  claude.ai/code または モバイルアプリに新しいセッションとして表示されます"
+  fi
+}
+
+cmd_switch() {
+  local -a pass_opts
+  pass_opts=()
+  while (( $# )); do
+    case "$1" in
+      --fork|--dry-run) pass_opts+=("$1") ;;
+      *) err "不明なオプション: $1"; return 1 ;;
+    esac
+    shift
+  done
+  need claude
+
+  print -- "── 1/4 RC 接続中の会話を保存 ──"
+  cmd_save || return 1
+
+  print
+  print -- "── 2/4 既存セッションの終了 ──"
+  print -- "上記の会話を開いているターミナル / クライアントをすべて終了してください。"
+  print -- "（開いたままだと restore 時に skip されます。複製復帰でよければ後で --fork も使えます）"
+  local _ans
+  read -r "_ans?終了したら Enter（中断は Ctrl-C）: "
+
+  print
+  print -- "── 3/4 アカウント切り替え ──"
+  claude auth logout || true
+  print -- "新しいアカウントでログインしてください:"
+  if ! claude auth login; then
+    err "ログインに失敗しました。ログイン後に 'claude-rc-reattach restore' で復帰できます（manifest は保存済み）"
+    return 1
+  fi
+
+  print
+  print -- "── 4/4 会話の復帰 ──"
+  cmd_restore "${pass_opts[@]}"
+}
+
+usage() {
+  cat <<EOF
+claude-rc-reattach v$VERSION
+アカウント切り替え後、Remote Control 接続中だった会話を新アカウントで復帰させるツール
+
+USAGE:
+  claude-rc-reattach <command> [options]
+
+COMMANDS:
+  list               RC 接続中の会話を表示（save の対象になるもの）
+  save               RC 接続中の会話を manifest に保存（切り替え「前」に実行）
+  restore [options]  manifest の会話を tmux 内で resume して RC 再登録（切り替え「後」に実行）
+  switch  [options]  save → logout → login → restore を一括実行
+  help               このヘルプを表示
+
+RESTORE/SWITCH OPTIONS:
+  --fork      元プロセスが開いたままの会話を --fork-session で複製として復帰
+  --dry-run   実際には起動せず、何が行われるかだけ表示
+
+ENVIRONMENT:
+  CLAUDE_RC_MANIFEST       manifest の保存先（既定: $STATE_DIR/manifest.tsv）
+  CLAUDE_RC_TMUX_SESSION   復帰先の tmux セッション名（既定: rc-restore）
+EOF
+}
+
+case "${1:-help}" in
+  list)      shift; cmd_list "$@" ;;
+  save)      shift; cmd_save "$@" ;;
+  restore)   shift; cmd_restore "$@" ;;
+  switch)    shift; cmd_switch "$@" ;;
+  -h|--help|help) usage ;;
+  -v|--version)   print -- "$VERSION" ;;
+  *) err "不明なコマンド: $1"; print; usage; exit 1 ;;
+esac
