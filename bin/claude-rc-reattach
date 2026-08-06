@@ -12,7 +12,7 @@
 set -u
 set -o pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/claude-rc-reattach"
 MANIFEST="${CLAUDE_RC_MANIFEST:-$STATE_DIR/manifest.tsv}"
 TMUX_SESSION="${CLAUDE_RC_TMUX_SESSION:-rc-restore}"
@@ -114,10 +114,11 @@ cmd_save() {
 }
 
 cmd_restore() {
-  local fork=0 dry=0
+  local fork=1 dry=0
   while (( $# )); do
     case "$1" in
       --fork)    fork=1 ;;
+      --no-fork) fork=0 ;;
       --dry-run) dry=1 ;;
       *) err "不明なオプション: $1"; return 1 ;;
     esac
@@ -178,7 +179,7 @@ cmd_restore() {
         claude_cmd+=(--fork-session)
         info "$label: 元のプロセスが開いたままのため --fork-session で複製として復帰します"
       else
-        err "$label: この会話は別プロセスで開いたままです → skip（そちらを閉じるか、--fork を付けて実行）"
+        err "$label: この会話は別プロセスで開いたままです → skip（--no-fork 指定のため。複製復帰でよければ --no-fork を外して実行）"
         (( skipped++ )) || true
         continue
       fi
@@ -218,7 +219,7 @@ cmd_switch() {
   pass_opts=()
   while (( $# )); do
     case "$1" in
-      --fork|--dry-run) pass_opts+=("$1") ;;
+      --fork|--no-fork|--dry-run) pass_opts+=("$1") ;;
       *) err "不明なオプション: $1"; return 1 ;;
     esac
     shift
@@ -231,7 +232,8 @@ cmd_switch() {
   print
   print -- "── 2/4 既存セッションの終了 ──"
   print -- "上記の会話を開いているターミナル / クライアントをすべて終了してください。"
-  print -- "（開いたままだと restore 時に skip されます。複製復帰でよければ後で --fork も使えます）"
+  print -- "（開いたままの会話は複製（--fork-session）として復帰します。同一セッションとして"
+  print -- "  復帰させたい場合は必ず閉じてください。複製せず skip したい場合は --no-fork）"
   local _ans
   read -r "_ans?終了したら Enter（中断は Ctrl-C）: "
 
@@ -265,7 +267,8 @@ COMMANDS:
   help               このヘルプを表示
 
 RESTORE/SWITCH OPTIONS:
-  --fork      元プロセスが開いたままの会話を --fork-session で複製として復帰
+  --no-fork   元プロセスが開いたままの会話を複製せず skip する
+              （既定: --fork-session で複製として復帰。元の会話は変更されない）
   --dry-run   実際には起動せず、何が行われるかだけ表示
 
 ENVIRONMENT:
