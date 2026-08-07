@@ -139,7 +139,7 @@ $ claude-rc-reattach restore
 
 引き継ぎたくない場合は `--no-inherit-perms` を付けてください。
 手動で指定したい場合や、検出できないケースを補いたい場合は、環境変数 `CLAUDE_RC_CLAUDE_ARGS` が使えます。
-restore 時の `claude` コマンドにそのまま追加され、**権限モードを指定した場合は自動引き継ぎより優先されます**（二重指定にはなりません）:
+restore 時の `claude` コマンドにそのまま追加され、**引き継ぎ対象のフラグ（上記 4 種のいずれか）を指定した場合は自動引き継ぎより優先されます**（二重指定にはなりません）:
 
 ```bash
 CLAUDE_RC_CLAUDE_ARGS="--dangerously-skip-permissions" claude-rc-reattach restore
@@ -201,6 +201,10 @@ RC 接続中かどうかは、Claude Code が実行中セッションごとに�
 - **`save` は RC 接続中のセッションが生きている間に実行してください。**
   セッションを閉じると `~/.claude/sessions/` の状態ファイルが消え、検出できなくなります。
   権限モードも生きているプロセスの起動引数から読むため、同じタイミングでしか取得できません
+- **権限モードの検出は `ps` の起動引数から行うため、引用符の情報は失われます。**
+  `--append-system-prompt "... --permission-mode plan ..."` のように他オプションの値の中に
+  権限フラグと同じ語が含まれていると、誤って権限モードとして検出することがあります。
+  その場合は `--no-inherit-perms` で引き継ぎを無効化してください
 - `~/.claude/sessions/<PID>.json` は非公開の内部仕様です（v2.1.220 で動作検証）。
   Claude Code のアップデートで形式が変わる可能性があります。
   動かなくなったら `claude-rc-reattach list` の結果と `ls ~/.claude/sessions/` を見比べてください

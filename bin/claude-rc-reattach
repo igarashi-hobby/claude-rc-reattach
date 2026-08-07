@@ -12,7 +12,7 @@
 set -u
 set -o pipefail
 
-VERSION="1.3.0"
+VERSION="1.3.1"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/claude-rc-reattach"
 MANIFEST="${CLAUDE_RC_MANIFEST:-$STATE_DIR/manifest.tsv}"
 TMUX_SESSION="${CLAUDE_RC_TMUX_SESSION:-rc-restore}"
@@ -205,9 +205,14 @@ cmd_restore() {
   (( ${#claude_extra} )) && info "claude 追加オプション: ${claude_extra[*]}"
 
   # 環境変数側で権限モードを明示していたら、manifest から引き継いだ分は使わない（二重指定の回避）
+  # 判定対象は detect_perm_flags のホワイトリストと同じ 4 フラグ
+  # （--allow-dangerously-skip-permissions は --dangerously-skip-permissions の
+  #   substring パターンに一致しないため個別に列挙する）
   local perm_override=0
   if [[ "${claude_extra[*]}" == *--dangerously-skip-permissions* \
-     || "${claude_extra[*]}" == *--permission-mode* ]]; then
+     || "${claude_extra[*]}" == *--allow-dangerously-skip-permissions* \
+     || "${claude_extra[*]}" == *--permission-mode* \
+     || "${claude_extra[*]}" == *--permission-prompt-tool* ]]; then
     perm_override=1
   fi
 
