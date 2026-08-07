@@ -103,6 +103,7 @@ claude-rc-reattach switch
 | オプション | 動作 |
 |---|---|
 | `--no-fork` | 元プロセスが開いたままの会話を複製せず skip する |
+| `--no-inherit-perms` | save 時に検出した権限モードを引き継がない |
 | `--dry-run` | 実際には起動せず、何が行われるかだけ表示 |
 
 **元プロセスが開いたままの会話の扱い（既定 = 複製復帰）**:
@@ -111,13 +112,34 @@ claude-rc-reattach switch
 ただし複製後は 2 つの会話が別々に進むため、**同一の会話として復帰させたい場合は、restore の前に元のターミナルを閉じてください**。
 複製も作りたくない場合は `--no-fork` を付けると該当の会話を skip します。
 
-### 権限モードは引き継がれない（--dangerously-skip-permissions 等）
+### 権限モードの引き継ぎ（--dangerously-skip-permissions 等）
 
-`--dangerously-skip-permissions` などの権限モードは、会話ではなく**プロセス起動時の状態**のため、resume では引き継がれません。
-何もしなければ、復帰後のセッションは既定の権限モードで立ち上がります。
+`--dangerously-skip-permissions` などの権限モードは、会話ではなく**プロセス起動時の状態**のため、`--resume` では引き継がれません。
+そこで save の時点で元プロセスの起動引数を読み、restore で自動的に付け直します（既定で有効）。
 
-復帰後のセッションにも適用したい場合は、環境変数 `CLAUDE_RC_CLAUDE_ARGS` を付けて実行してください。
-restore 時の `claude` コマンドにそのまま追加されます:
+```
+$ claude-rc-reattach save
+✔ 2 件の会話を保存しました → ...
+  • my-project  [/path/to/project]  権限モード: --dangerously-skip-permissions
+
+$ claude-rc-reattach restore
+  my-project: 権限モードを引き継ぎます（--dangerously-skip-permissions）
+```
+
+引き継ぎ対象は `--dangerously-skip-permissions` / `--allow-dangerously-skip-permissions` / `--permission-mode` / `--permission-prompt-tool` です。
+`--model` などそれ以外のオプションは引き継ぎません。
+
+**有効にした方法によって挙動が変わります**:
+
+| bypass を有効にした方法 | 復帰後 |
+|---|---|
+| `claude --dangerously-skip-permissions` で起動 | **自動で引き継がれる**（save 時に検出） |
+| `~/.claude/settings.json` の `defaultMode` | 元から適用される（このツールは何もしない） |
+| セッション中に `/permissions` で変更 | 引き継がれない（どこにも記録されないため検出不可） |
+
+引き継ぎたくない場合は `--no-inherit-perms` を付けてください。
+手動で指定したい場合や、検出できないケースを補いたい場合は、環境変数 `CLAUDE_RC_CLAUDE_ARGS` が使えます。
+restore 時の `claude` コマンドにそのまま追加され、**権限モードを指定した場合は自動引き継ぎより優先されます**（二重指定にはなりません）:
 
 ```bash
 CLAUDE_RC_CLAUDE_ARGS="--dangerously-skip-permissions" claude-rc-reattach restore
@@ -129,7 +151,8 @@ CLAUDE_RC_CLAUDE_ARGS="--dangerously-skip-permissions --append-system-prompt '�
   claude-rc-reattach restore
 ```
 
-このツールに関係なく、すべてのセッションを常に bypass permissions で起動したい場合は、`~/.claude/settings.json` に恒久設定する方法もあります:
+このツールに関係なく、すべてのセッションを常に bypass permissions で起動したい場合は、`~/.claude/settings.json` に恒久設定する方法もあります。
+この場合は復帰後のセッションにも自動的に効くため、上記の引き継ぎは不要です:
 
 ```json
 {
@@ -164,6 +187,8 @@ save: RC接続中の会話を記録    →    restore: 各会話を claude --res
 
 RC 接続中かどうかは、Claude Code が実行中セッションごとに書き出す `~/.claude/sessions/<PID>.json` の `bridgeSessionId` フィールドの有無で判定しています。
 
+権限モードはこの状態ファイルには含まれないため、save 時に同ファイルの `pid` から `ps` で起動引数を読み、権限関連のフラグだけを manifest に記録しています。
+
 ## 制約・知っておくべきこと
 
 - **RC セッション ID は新規になります。**
@@ -174,7 +199,8 @@ RC 接続中かどうかは、Claude Code が実行中セッションごとに�
 - **複製（fork）復帰した会話は元の会話と分岐します。**
   復帰後に元のターミナル側で会話を続けても、復帰した側には反映されません
 - **`save` は RC 接続中のセッションが生きている間に実行してください。**
-  セッションを閉じると `~/.claude/sessions/` の状態ファイルが消え、検出できなくなります
+  セッションを閉じると `~/.claude/sessions/` の状態ファイルが消え、検出できなくなります。
+  権限モードも生きているプロセスの起動引数から読むため、同じタイミングでしか取得できません
 - `~/.claude/sessions/<PID>.json` は非公開の内部仕様です（v2.1.220 で動作検証）。
   Claude Code のアップデートで形式が変わる可能性があります。
   動かなくなったら `claude-rc-reattach list` の結果と `ls ~/.claude/sessions/` を見比べてください
@@ -188,7 +214,7 @@ RC 接続中かどうかは、Claude Code が実行中セッションごとに�
 | ウィンドウがすぐ落ちる | tmux 3.2 以降なら異常終了した pane が残るので、そこにエラーが表示されています。`tmux attach -t rc-restore` で確認 |
 | 「会話ログが見つかりません」で skip される | 該当プロジェクトの `~/.claude/projects/<エンコード名>/<sessionId>.jsonl` が存在するか確認 |
 | 「別プロセスで開いたままです」で skip される | `--no-fork` を付けた場合の動作です。外せば複製として復帰します（既定） |
-| 復帰後に `--dangerously-skip-permissions` が外れている | 仕様です（権限モードは resume で引き継がれない）。`CLAUDE_RC_CLAUDE_ARGS` を設定して restore してください（上記「権限モードは引き継がれない」参照） |
+| 復帰後に `--dangerously-skip-permissions` が外れている | save 時の manifest 5 列目に記録されているか確認（`save` の出力に「権限モード:」が出ていれば検出済み）。セッション中に `/permissions` で変更した場合は検出できないため、`CLAUDE_RC_CLAUDE_ARGS` で明示指定してください（上記「権限モードの引き継ぎ」参照） |
 
 ## ライセンス
 

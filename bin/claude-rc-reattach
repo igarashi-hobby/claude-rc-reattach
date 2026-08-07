@@ -12,7 +12,7 @@
 set -u
 set -o pipefail
 
-VERSION="1.2.0"
+VERSION="1.3.0"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/claude-rc-reattach"
 MANIFEST="${CLAUDE_RC_MANIFEST:-$STATE_DIR/manifest.tsv}"
 TMUX_SESSION="${CLAUDE_RC_TMUX_SESSION:-rc-restore}"
@@ -74,6 +74,38 @@ encode_project_dir() {
   print -r -- "$1" | sed 's/[^A-Za-z0-9]/-/g'
 }
 
+# 実行中プロセスの起動引数から権限モード関連のフラグだけを抜き出す
+#   権限モードは会話ではなくプロセス起動時の状態のため ~/.claude/sessions/*.json には残らない。
+#   save の時点なら元プロセスが生きているので、コマンドラインから拾える。
+#   ホワイトリスト方式（--resume 等の復帰時に邪魔な引数を巻き込まないため）
+detect_perm_flags() {
+  local pid="$1" args
+  args=$(ps -p "$pid" -o args= 2>/dev/null) || return 0
+  [[ -z "$args" ]] && return 0
+  local -a words out
+  words=(${=args})
+  out=()
+  local i=1
+  while (( i <= ${#words} )); do
+    case "${words[i]}" in
+      --dangerously-skip-permissions|--allow-dangerously-skip-permissions)
+        out+=("${words[i]}") ;;
+      --permission-mode|--permission-prompt-tool)
+        # 値を取る形式。次の語が別のオプションなら値なしとみなす
+        if [[ "${words[i+1]:-}" == -* || -z "${words[i+1]:-}" ]]; then
+          :
+        else
+          out+=("${words[i]}" "${words[i+1]}")
+          (( i++ ))
+        fi ;;
+      --permission-mode=*|--permission-prompt-tool=*)
+        out+=("${words[i]}") ;;
+    esac
+    (( i++ ))
+  done
+  print -r -- "${out[*]}"
+}
+
 cmd_list() {
   need python3
   local rows
@@ -97,29 +129,41 @@ cmd_save() {
     err "（RC 接続中のセッションを開いた状態で実行してください。/rc active がフッターに出ているか確認）"
     return 1
   fi
+  # 5 列目として権限モードのフラグを記録する（restore で引き継ぐため）。
+  # 元プロセスが生きているこの時点でしか取れない情報
+  local rows_ext
+  rows_ext=$(print -r -- "$rows" | while IFS=$'\t' read -r sid cwd name pid; do
+    printf '%s\t%s\t%s\t%s\t%s\n' "$sid" "$cwd" "$name" "$pid" "$(detect_perm_flags "$pid")"
+  done)
+
   mkdir -p "${MANIFEST:h}"
   local email
   email=$(auth_info | awk '{print $3}')
   {
-    print -- "# claude-rc-reattach manifest v1"
+    print -- "# claude-rc-reattach manifest v2"
     print -- "# saved_at=$(date '+%Y-%m-%dT%H:%M:%S%z') account=$email"
-    print -r -- "$rows"
+    print -r -- "$rows_ext"
   } > "$MANIFEST"
   local n
-  n=$(print -r -- "$rows" | wc -l | tr -d ' ')
+  n=$(print -r -- "$rows_ext" | wc -l | tr -d ' ')
   ok "$n 件の会話を保存しました → $MANIFEST"
-  print -r -- "$rows" | while IFS=$'\t' read -r sid cwd name pid; do
-    info "• ${name:-(無名)}  [$cwd]"
+  print -r -- "$rows_ext" | while IFS=$'\t' read -r sid cwd name pid perm; do
+    if [[ -n "$perm" ]]; then
+      info "• ${name:-(無名)}  [$cwd]  権限モード: $perm"
+    else
+      info "• ${name:-(無名)}  [$cwd]"
+    fi
   done
 }
 
 cmd_restore() {
-  local fork=1 dry=0
+  local fork=1 dry=0 inherit_perms=1
   while (( $# )); do
     case "$1" in
       --fork)    fork=1 ;;
       --no-fork) fork=0 ;;
       --dry-run) dry=1 ;;
+      --no-inherit-perms) inherit_perms=0 ;;
       *) err "不明なオプション: $1"; return 1 ;;
     esac
     shift
@@ -160,10 +204,17 @@ cmd_restore() {
   claude_extra=(${(Q)${(z)${CLAUDE_RC_CLAUDE_ARGS:-}}})
   (( ${#claude_extra} )) && info "claude 追加オプション: ${claude_extra[*]}"
 
+  # 環境変数側で権限モードを明示していたら、manifest から引き継いだ分は使わない（二重指定の回避）
+  local perm_override=0
+  if [[ "${claude_extra[*]}" == *--dangerously-skip-permissions* \
+     || "${claude_extra[*]}" == *--permission-mode* ]]; then
+    perm_override=1
+  fi
+
   local resumed=0 skipped=0
-  local sid cwd name opid label enc transcript win cmd_str
-  local -a claude_cmd
-  while IFS=$'\t' read -r sid cwd name opid; do
+  local sid cwd name opid perm label enc transcript win cmd_str
+  local -a claude_cmd perm_args
+  while IFS=$'\t' read -r sid cwd name opid perm; do
     [[ -z "$sid" || "$sid" == \#* ]] && continue
     label="${name:-$sid}"
 
@@ -181,7 +232,14 @@ cmd_restore() {
       continue
     fi
 
-    claude_cmd=(claude --resume "$sid" "${claude_extra[@]}")
+    # manifest に記録された権限モード（save 時の元プロセスの起動引数）を引き継ぐ
+    perm_args=()
+    if [[ -n "$perm" ]] && (( inherit_perms && ! perm_override )); then
+      perm_args=(${(z)perm})
+      info "$label: 権限モードを引き継ぎます（${perm_args[*]}）"
+    fi
+
+    claude_cmd=(claude --resume "$sid" "${perm_args[@]}" "${claude_extra[@]}")
     if print -r -- "$open_ids" | grep -qx -- "$sid"; then
       if (( fork )); then
         claude_cmd+=(--fork-session)
@@ -232,7 +290,7 @@ cmd_switch() {
   pass_opts=()
   while (( $# )); do
     case "$1" in
-      --fork|--no-fork|--dry-run) pass_opts+=("$1") ;;
+      --fork|--no-fork|--dry-run|--no-inherit-perms) pass_opts+=("$1") ;;
       *) err "不明なオプション: $1"; return 1 ;;
     esac
     shift
@@ -280,15 +338,18 @@ COMMANDS:
   help               このヘルプを表示
 
 RESTORE/SWITCH OPTIONS:
-  --no-fork   元プロセスが開いたままの会話を複製せず skip する
-              （既定: --fork-session で複製として復帰。元の会話は変更されない）
-  --dry-run   実際には起動せず、何が行われるかだけ表示
+  --no-fork            元プロセスが開いたままの会話を複製せず skip する
+                       （既定: --fork-session で複製として復帰。元の会話は変更されない）
+  --no-inherit-perms   save 時に検出した権限モードを引き継がない
+                       （既定: 引き継ぐ。--dangerously-skip-permissions 等）
+  --dry-run            実際には起動せず、何が行われるかだけ表示
 
 ENVIRONMENT:
   CLAUDE_RC_MANIFEST       manifest の保存先（既定: $STATE_DIR/manifest.tsv）
   CLAUDE_RC_TMUX_SESSION   復帰先の tmux セッション名（既定: rc-restore）
   CLAUDE_RC_CLAUDE_ARGS    restore 時に claude コマンドへ追加するオプション
                            （例: "--dangerously-skip-permissions"）
+                           権限モードを指定した場合は自動引き継ぎより優先される
 EOF
 }
 
