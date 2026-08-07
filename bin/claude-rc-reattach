@@ -12,7 +12,7 @@
 set -u
 set -o pipefail
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/claude-rc-reattach"
 MANIFEST="${CLAUDE_RC_MANIFEST:-$STATE_DIR/manifest.tsv}"
 TMUX_SESSION="${CLAUDE_RC_TMUX_SESSION:-rc-restore}"
@@ -152,8 +152,16 @@ cmd_restore() {
 
   # 注意: zsh ではループ内で `local` を再宣言すると変数の中身が出力されるため、
   # ループで使う変数はここでまとめて宣言する
+  # CLAUDE_RC_CLAUDE_ARGS: restore 時の claude コマンドに追加するオプション
+  # （権限モードは resume で引き継がれないため、--dangerously-skip-permissions 等はここで渡す）
+  # (z) でシェルと同じ規則に分割し、(Q) で引数を囲むクォートを外す
+  # （"--append-system-prompt 'foo bar'" のようにスペースを含む引数も 1 個として渡せる）
+  local -a claude_extra
+  claude_extra=(${(Q)${(z)${CLAUDE_RC_CLAUDE_ARGS:-}}})
+  (( ${#claude_extra} )) && info "claude 追加オプション: ${claude_extra[*]}"
+
   local resumed=0 skipped=0
-  local sid cwd name opid label enc transcript win
+  local sid cwd name opid label enc transcript win cmd_str
   local -a claude_cmd
   while IFS=$'\t' read -r sid cwd name opid; do
     [[ -z "$sid" || "$sid" == \#* ]] && continue
@@ -173,7 +181,7 @@ cmd_restore() {
       continue
     fi
 
-    claude_cmd=(claude --resume "$sid")
+    claude_cmd=(claude --resume "$sid" "${claude_extra[@]}")
     if print -r -- "$open_ids" | grep -qx -- "$sid"; then
       if (( fork )); then
         claude_cmd+=(--fork-session)
@@ -187,18 +195,23 @@ cmd_restore() {
 
     win="${label//[^A-Za-z0-9_.-]/-}"
     win="${win[1,30]}"
+
+    # tmux はコマンドをシェル文字列として受け取り sh -c で実行するため、
+    # 各引数を個別にクォートしておく（スペースを含む CLAUDE_RC_CLAUDE_ARGS が分裂するのを防ぐ）
+    cmd_str="${(j: :)${(q-)claude_cmd[@]}}"
+
     if (( dry )); then
-      ok "[dry-run] $label: tmux '$TMUX_SESSION' で実行 → ${claude_cmd[*]} @ $cwd"
+      ok "[dry-run] $label: tmux '$TMUX_SESSION' で実行 → $cmd_str @ $cwd"
       (( resumed++ )) || true
       continue
     fi
 
     if ! tmux has-session -t "=$TMUX_SESSION" 2>/dev/null; then
-      tmux new-session -d -s "$TMUX_SESSION" -c "$cwd" -n "$win" "${claude_cmd[*]}" </dev/null
+      tmux new-session -d -s "$TMUX_SESSION" -c "$cwd" -n "$win" "$cmd_str" </dev/null
       # claude が異常終了した場合だけ pane を残す（原因確認用）。未対応の tmux では無視
       tmux set-option -t "$TMUX_SESSION" remain-on-exit failed 2>/dev/null || true
     else
-      tmux new-window -t "$TMUX_SESSION" -c "$cwd" -n "$win" "${claude_cmd[*]}" </dev/null
+      tmux new-window -t "$TMUX_SESSION" -c "$cwd" -n "$win" "$cmd_str" </dev/null
     fi
     ok "$label: 復帰しました（tmux window: $win）"
     (( resumed++ )) || true
@@ -274,6 +287,8 @@ RESTORE/SWITCH OPTIONS:
 ENVIRONMENT:
   CLAUDE_RC_MANIFEST       manifest の保存先（既定: $STATE_DIR/manifest.tsv）
   CLAUDE_RC_TMUX_SESSION   復帰先の tmux セッション名（既定: rc-restore）
+  CLAUDE_RC_CLAUDE_ARGS    restore 時に claude コマンドへ追加するオプション
+                           （例: "--dangerously-skip-permissions"）
 EOF
 }
 
