@@ -70,8 +70,7 @@ resume したセッションが自動的に RC 登録されるようになりま
 }
 ```
 
-> **注意**: この設定を入れても `/config` 画面の「Enable Remote Control for all sessions」が
-> false 表示にリセットされて見える既知バグがあります（[#29929](https://github.com/anthropics/claude-code/issues/29929)）。
+> **注意**: この設定を入れても `/config` 画面の「Enable Remote Control for all sessions」が false 表示にリセットされて見える既知バグがあります（[#29929](https://github.com/anthropics/claude-code/issues/29929)）。
 > 有効かどうかは **/config の表示ではなく、セッションのフッターに `/rc active` が出るか**で確認してください。
 
 ## コマンド
@@ -202,8 +201,7 @@ RC 接続中かどうかは、Claude Code が実行中セッションごとに�
   セッションを閉じると `~/.claude/sessions/` の状態ファイルが消え、検出できなくなります。
   権限モードも生きているプロセスの起動引数から読むため、同じタイミングでしか取得できません
 - **権限モードの検出は `ps` の起動引数から行うため、引用符の情報は失われます。**
-  `--append-system-prompt "... --permission-mode plan ..."` のように他オプションの値の中に
-  権限フラグと同じ語が含まれていると、誤って権限モードとして検出することがあります。
+  `--append-system-prompt "... --permission-mode plan ..."` のように他オプションの値の中に権限フラグと同じ語が含まれていると、誤って権限モードとして検出することがあります。
   その場合は `--no-inherit-perms` で引き継ぎを無効化してください
 - `~/.claude/sessions/<PID>.json` は非公開の内部仕様です（v2.1.220 で動作検証）。
   Claude Code のアップデートで形式が変わる可能性があります。
