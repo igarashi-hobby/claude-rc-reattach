@@ -12,11 +12,12 @@
 set -u
 set -o pipefail
 
-VERSION="1.3.1"
+VERSION="1.4.0"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/claude-rc-reattach"
 MANIFEST="${CLAUDE_RC_MANIFEST:-$STATE_DIR/manifest.tsv}"
 TMUX_SESSION="${CLAUDE_RC_TMUX_SESSION:-rc-restore}"
 SESSIONS_DIR="$HOME/.claude/sessions"
+MAX_AGE_DAYS="${CLAUDE_RC_MAX_AGE_DAYS:-7}"
 
 err()  { print -u2 -- "✖ $*"; }
 warn() { print -- "⚠ $*"; }
@@ -72,6 +73,42 @@ print("yes" if d.get("loggedIn") else "no", d.get("subscriptionType") or "-", d.
 # 作業ディレクトリ → ~/.claude/projects/ 配下のディレクトリ名（非英数字を - に置換）
 encode_project_dir() {
   print -r -- "$1" | sed 's/[^A-Za-z0-9]/-/g'
+}
+
+# 会話ログ（transcript）の最終エントリの時刻を epoch 秒で返す
+#   末尾 64KB だけ読んで最後の timestamp を拾う（ログは追記型で数十 MB になり得るため）。
+#   timestamp が見つからなければファイルの mtime にフォールバック
+transcript_last_epoch() {
+  python3 - "$1" <<'PY'
+import os, re, sys
+from datetime import datetime
+
+path = sys.argv[1]
+epoch = None
+try:
+    with open(path, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        f.seek(max(0, f.tell() - 65536))
+        tail = f.read().decode("utf-8", "replace")
+    # seek で先頭行が欠けていても拾えるよう、json.loads ではなく正規表現で探す
+    for line in reversed(tail.splitlines()):
+        m = re.search(r'"timestamp"\s*:\s*"([^"]+)"', line)
+        if not m:
+            continue
+        try:
+            epoch = datetime.fromisoformat(m.group(1).replace("Z", "+00:00")).timestamp()
+            break
+        except ValueError:
+            continue
+except OSError:
+    pass
+if epoch is None:
+    try:
+        epoch = os.path.getmtime(path)
+    except OSError:
+        epoch = 0
+print(int(epoch))
+PY
 }
 
 # 実行中プロセスの起動引数から権限モード関連のフラグだけを抜き出す
@@ -216,8 +253,9 @@ cmd_restore() {
     perm_override=1
   fi
 
-  local resumed=0 skipped=0
-  local sid cwd name opid perm label enc transcript win cmd_str
+  local resumed=0 skipped=0 now
+  now=$(date +%s)
+  local sid cwd name opid perm label enc transcript win cmd_str last_epoch age_days
   local -a claude_cmd perm_args
   while IFS=$'\t' read -r sid cwd name opid perm; do
     [[ -z "$sid" || "$sid" == \#* ]] && continue
@@ -235,6 +273,17 @@ cmd_restore() {
       err "$label: 会話ログが見つかりません → skip ($transcript)"
       (( skipped++ )) || true
       continue
+    fi
+
+    # 最終チャットが古すぎる会話は復帰させない（CLAUDE_RC_MAX_AGE_DAYS=0 で無効化）
+    if (( MAX_AGE_DAYS > 0 )); then
+      last_epoch=$(transcript_last_epoch "$transcript")
+      if (( now - last_epoch > MAX_AGE_DAYS * 86400 )); then
+        (( age_days = (now - last_epoch) / 86400 )) || true
+        warn "$label: 最終チャットが ${age_days} 日前（上限 ${MAX_AGE_DAYS} 日）→ skip"
+        (( skipped++ )) || true
+        continue
+      fi
     fi
 
     # manifest に記録された権限モード（save 時の元プロセスの起動引数）を引き継ぐ
@@ -355,6 +404,8 @@ ENVIRONMENT:
   CLAUDE_RC_CLAUDE_ARGS    restore 時に claude コマンドへ追加するオプション
                            （例: "--dangerously-skip-permissions"）
                            権限モードを指定した場合は自動引き継ぎより優先される
+  CLAUDE_RC_MAX_AGE_DAYS   最終チャットからこの日数を超えた会話は restore で skip する
+                           （既定: 7。0 で無効化）
 EOF
 }
 
