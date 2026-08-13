@@ -12,12 +12,12 @@
 set -u
 set -o pipefail
 
-VERSION="1.4.0"
+VERSION="1.5.0"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/claude-rc-reattach"
 MANIFEST="${CLAUDE_RC_MANIFEST:-$STATE_DIR/manifest.tsv}"
 TMUX_SESSION="${CLAUDE_RC_TMUX_SESSION:-rc-restore}"
 SESSIONS_DIR="$HOME/.claude/sessions"
-MAX_AGE_DAYS="${CLAUDE_RC_MAX_AGE_DAYS:-7}"
+MAX_AGE_DAYS="${CLAUDE_RC_MAX_AGE_DAYS:-3}"
 
 err()  { print -u2 -- "✖ $*"; }
 warn() { print -- "⚠ $*"; }

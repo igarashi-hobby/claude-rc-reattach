@@ -111,8 +111,8 @@ claude-rc-reattach switch
 ただし複製後は 2 つの会話が別々に進むため、**同一の会話として復帰させたい場合は、restore の前に元のターミナルを閉じてください**。
 複製も作りたくない場合は `--no-fork` を付けると該当の会話を skip します。
 
-**古い会話は復帰対象外（既定 = 最終チャットから 7 日以内のみ）**:
-会話ログの最終エントリが 7 日より前の会話は、放置されたものとみなして restore で skip します。
+**古い会話は復帰対象外（既定 = 最終チャットから 3 日以内のみ）**:
+会話ログの最終エントリが 3 日より前の会話は、放置されたものとみなして restore で skip します。
 上限日数は環境変数 `CLAUDE_RC_MAX_AGE_DAYS` で変更でき、`0` にするとこのチェック自体を無効化できます。
 
 ### 権限モードの引き継ぎ（--dangerously-skip-permissions 等）
@@ -172,7 +172,7 @@ CLAUDE_RC_CLAUDE_ARGS="--dangerously-skip-permissions --append-system-prompt '�
 | `CLAUDE_RC_MANIFEST` | `~/.local/state/claude-rc-reattach/manifest.tsv` | manifest の保存先 |
 | `CLAUDE_RC_TMUX_SESSION` | `rc-restore` | 復帰先の tmux セッション名 |
 | `CLAUDE_RC_CLAUDE_ARGS` | （なし） | restore 時に `claude` コマンドへ追加するオプション（スペース区切りで複数可。値にスペースを含む場合は `'...'` か `"..."` で囲む） |
-| `CLAUDE_RC_MAX_AGE_DAYS` | `7` | 最終チャットからこの日数を超えた会話は restore で skip する（`0` で無効化） |
+| `CLAUDE_RC_MAX_AGE_DAYS` | `3` | 最終チャットからこの日数を超えた会話は restore で skip する（`0` で無効化） |
 
 ## 仕組み
 
@@ -221,7 +221,7 @@ RC 接続中かどうかは、Claude Code が実行中セッションごとに�
 | ウィンドウがすぐ落ちる | tmux 3.2 以降なら異常終了した pane が残るので、そこにエラーが表示されています。`tmux attach -t rc-restore` で確認 |
 | 「会話ログが見つかりません」で skip される | 該当プロジェクトの `~/.claude/projects/<エンコード名>/<sessionId>.jsonl` が存在するか確認 |
 | 「別プロセスで開いたままです」で skip される | `--no-fork` を付けた場合の動作です。外せば複製として復帰します（既定） |
-| 「最終チャットが N 日前」で skip される | 既定で最終チャットが 7 日より古い会話は復帰しません。`CLAUDE_RC_MAX_AGE_DAYS` で上限を変更するか、`CLAUDE_RC_MAX_AGE_DAYS=0` で無効化できます |
+| 「最終チャットが N 日前」で skip される | 既定で最終チャットが 3 日より古い会話は復帰しません。`CLAUDE_RC_MAX_AGE_DAYS` で上限を変更するか、`CLAUDE_RC_MAX_AGE_DAYS=0` で無効化できます |
 | 復帰後に `--dangerously-skip-permissions` が外れている | save 時の manifest 5 列目に記録されているか確認（`save` の出力に「権限モード:」が出ていれば検出済み）。セッション中に `/permissions` で変更した場合は検出できないため、`CLAUDE_RC_CLAUDE_ARGS` で明示指定してください（上記「権限モードの引き継ぎ」参照） |
 
 ## ライセンス
