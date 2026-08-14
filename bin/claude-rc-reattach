@@ -7,25 +7,56 @@
 #   save でそれを manifest に記録し、restore で `claude --resume <sessionId>` を
 #   tmux 内に立ち上げ直すことで、新アカウント配下の新しい RC セッションとして再登録する。
 #
-# 検証環境: Claude Code v2.1.220 / macOS
+# 検証環境: Claude Code v2.1.232 / macOS
 
 set -u
 set -o pipefail
 
-VERSION="1.5.0"
+VERSION="1.6.0"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/claude-rc-reattach"
 MANIFEST="${CLAUDE_RC_MANIFEST:-$STATE_DIR/manifest.tsv}"
 TMUX_SESSION="${CLAUDE_RC_TMUX_SESSION:-rc-restore}"
 SESSIONS_DIR="$HOME/.claude/sessions"
 MAX_AGE_DAYS="${CLAUDE_RC_MAX_AGE_DAYS:-3}"
+VERIFY_TIMEOUT="${CLAUDE_RC_VERIFY_TIMEOUT:-60}"
+STAGGER_SECS="${CLAUDE_RC_STAGGER_SECS:-3}"
 
 err()  { print -u2 -- "✖ $*"; }
 warn() { print -- "⚠ $*"; }
 info() { print -- "  $*"; }
 ok()   { print -- "✔ $*"; }
 
+# 数値系の環境変数は不正値なら既定値に戻す
+# （非数値のまま (( )) で比較すると zsh が実行時エラーを出し、チェックが素通りするため）
+if [[ "$MAX_AGE_DAYS" != <-> ]]; then
+  warn "CLAUDE_RC_MAX_AGE_DAYS='$MAX_AGE_DAYS' は数値ではないため既定値 3 を使います"
+  MAX_AGE_DAYS=3
+fi
+if [[ "$VERIFY_TIMEOUT" != <-> ]]; then
+  warn "CLAUDE_RC_VERIFY_TIMEOUT='$VERIFY_TIMEOUT' は数値ではないため既定値 60 を使います"
+  VERIFY_TIMEOUT=60
+fi
+if [[ "$STAGGER_SECS" != <-> ]]; then
+  warn "CLAUDE_RC_STAGGER_SECS='$STAGGER_SECS' は数値ではないため既定値 3 を使います"
+  STAGGER_SECS=3
+fi
+
 need() {
   command -v "$1" >/dev/null 2>&1 || { err "'$1' が見つかりません。インストールしてください"; exit 1; }
+}
+
+# tmux が無い場合はインストール方法を案内して失敗させる
+#   list / save は tmux 不要のため need() ではなくコマンド側で個別にチェックする。
+#   switch は logout 後に気づくと手遅れなので、冒頭でもこれを呼ぶ
+need_tmux() {
+  command -v tmux >/dev/null 2>&1 && return 0
+  err "'tmux' が見つかりません。restore / reconnect / switch には tmux が必要です"
+  if [[ "$OSTYPE" == darwin* ]]; then
+    info "インストール方法: brew install tmux"
+  else
+    info "インストール方法: sudo apt install tmux（Debian/Ubuntu）/ sudo dnf install tmux（Fedora）等"
+  fi
+  return 1
 }
 
 # 実行中の interactive セッションを TSV で列挙する
@@ -57,6 +88,143 @@ for path in sorted(glob.glob(os.path.join(sessions_dir, "*.json"))):
         continue
     print("\t".join([sid, cwd, d.get("name") or "", str(pid)]))
 PY
+}
+
+# tmux の pane_pid ごとに、その配下で動く claude セッションの RC 状態を TSV で返す
+#   出力: pane_pid<TAB>state<TAB>sessionId
+#   state: connected（bridgeSessionId あり）/ pending（状態ファイルはあるが RC 未登録）/ missing（未検出）
+#   tmux はコマンドを sh -c で実行するため、claude の PID は pane_pid 本人（exec 最適化時）か
+#   その子孫になる。ps の親子関係を辿って対応づける
+pane_rc_status() {
+  python3 - "$SESSIONS_DIR" "$@" <<'PY'
+import glob, json, os, subprocess, sys
+sessions_dir = sys.argv[1]
+targets = [int(x) for x in sys.argv[2:] if x.strip().isdigit()]
+parent = {}
+out = subprocess.run(["ps", "-ax", "-o", "pid=,ppid="], capture_output=True, text=True).stdout
+for line in out.splitlines():
+    try:
+        pid, ppid = map(int, line.split())
+        parent[pid] = ppid
+    except ValueError:
+        continue
+def ancestor_depth(pid, target, limit=5):
+    depth = 0
+    while depth <= limit:
+        if pid == target:
+            return depth
+        if pid not in parent:
+            return None
+        pid = parent[pid]
+        depth += 1
+    return None
+# 同一 pane 配下に複数のセッションがマッチし得る（復帰した claude が子の claude を
+# 起動した場合など）。pane に最も近いプロセスを採用し、同深度なら connected を優先する
+best = {t: None for t in targets}
+for path in sorted(glob.glob(os.path.join(sessions_dir, "*.json"))):
+    try:
+        d = json.load(open(path))
+    except Exception:
+        continue
+    # scan_sessions と同じ条件で絞る（kind と PID 生存。死んだプロセスの残存
+    # ファイルを PID 再利用のプロセスと誤対応させないため）
+    if d.get("kind") != "interactive":
+        continue
+    pid = d.get("pid")
+    if not isinstance(pid, int):
+        continue
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        continue
+    for t in targets:
+        depth = ancestor_depth(pid, t)
+        if depth is None:
+            continue
+        state = "connected" if d.get("bridgeSessionId") else "pending"
+        cand = (depth, 0 if state == "connected" else 1, state, d.get("sessionId") or "")
+        if best[t] is None or cand[:2] < best[t][:2]:
+            best[t] = cand
+for t in targets:
+    if best[t] is None:
+        print(f"{t}\tmissing\t")
+    else:
+        print(f"{t}\t{best[t][2]}\t{best[t][3]}")
+PY
+}
+
+# "pane_pid<TAB>label" の組を受け取り、各 pane 配下のセッションが RC 登録されるまで待つ
+#   登録を確認できたものから順に結果を表示し、全滅／タイムアウトで抜ける。
+#   1 件でも未登録があれば非 0 を返す
+wait_rc_registration() {
+  local timeout="$1"; shift
+  local -a entries panes
+  entries=("$@")
+  typeset -A label_of state_of present
+  local e pane label deadline st sid ng=0 all_done out panes_now
+  panes=()
+  for e in "${entries[@]}"; do
+    pane="${e%%$'\t'*}"
+    label="${e#*$'\t'}"
+    [[ -z "$pane" ]] && continue
+    panes+=("$pane")
+    label_of[$pane]="$label"
+    state_of[$pane]="missing"
+  done
+  (( ${#panes} )) || return 0
+  deadline=$(( $(date +%s) + timeout ))
+  while :; do
+    out=$(pane_rc_status "${panes[@]}")
+    print -r -- "$out" | while IFS=$'\t' read -r pane st sid; do
+      case "${state_of[$pane]:-}" in connected|died|vanished) continue ;; esac
+      if [[ "$st" == connected ]]; then
+        state_of[$pane]="connected"
+        ok "${label_of[$pane]}: RC 登録を確認しました"
+      else
+        state_of[$pane]="$st"
+      fi
+    done
+    # claude が異常終了した pane の検知（remain-on-exit failed で残っているもの）と、
+    # pane ごと消えたケース（正常終了、または tmux が remain-on-exit failed 未対応）の検知
+    panes_now=$(tmux list-panes -s -t "=$TMUX_SESSION" -F '#{pane_pid} #{pane_dead}' 2>/dev/null)
+    if [[ -n "$panes_now" ]]; then
+      present=()
+      print -r -- "$panes_now" | while read -r pane st; do
+        present[$pane]=1
+        if [[ "$st" == 1 && -n "${label_of[$pane]:-}" && "${state_of[$pane]}" != connected && "${state_of[$pane]}" != died ]]; then
+          state_of[$pane]="died"
+          err "${label_of[$pane]}: claude が終了しています（tmux attach -t $TMUX_SESSION で pane のエラーを確認）"
+        fi
+      done
+      for pane in "${panes[@]}"; do
+        case "${state_of[$pane]}" in connected|died|vanished) continue ;; esac
+        if [[ -z "${present[$pane]:-}" ]]; then
+          state_of[$pane]="vanished"
+          err "${label_of[$pane]}: pane が終了して消えています（claude が終了した可能性。tmux attach -t $TMUX_SESSION で確認）"
+        fi
+      done
+    fi
+    all_done=1
+    for pane in "${panes[@]}"; do
+      case "${state_of[$pane]}" in connected|died|vanished) ;; *) all_done=0 ;; esac
+    done
+    (( all_done )) && break
+    (( $(date +%s) >= deadline )) && break
+    sleep 2
+  done
+  for pane in "${panes[@]}"; do
+    case "${state_of[$pane]}" in
+      connected) ;;
+      died|vanished) (( ng++ )) || true ;;
+      pending)
+        warn "${label_of[$pane]}: 起動は確認できましたが、時間内に RC 登録されませんでした"
+        (( ng++ )) || true ;;
+      *)
+        warn "${label_of[$pane]}: claude セッションの起動を確認できませんでした"
+        (( ng++ )) || true ;;
+    esac
+  done
+  return $(( ng > 0 ))
 }
 
 # "loggedIn plan email" の3語を返す
@@ -206,7 +374,7 @@ cmd_restore() {
     shift
   done
   need python3
-  need tmux
+  need_tmux || return 1
   need claude
 
   if [[ ! -f "$MANIFEST" ]]; then
@@ -255,8 +423,9 @@ cmd_restore() {
 
   local resumed=0 skipped=0 now
   now=$(date +%s)
-  local sid cwd name opid perm label enc transcript win cmd_str last_epoch age_days
-  local -a claude_cmd perm_args
+  local sid cwd name opid perm label enc transcript win cmd_str last_epoch age_days pane_id pane_pid
+  local -a claude_cmd perm_args v_entries
+  v_entries=()
   while IFS=$'\t' read -r sid cwd name opid perm; do
     [[ -z "$sid" || "$sid" == \#* ]] && continue
     label="${name:-$sid}"
@@ -318,25 +487,157 @@ cmd_restore() {
       continue
     fi
 
+    # 同時起動を避けて起動間隔を空ける（credential の同時発行・同時失効を緩和するため）
+    (( ${#v_entries} > 0 && STAGGER_SECS > 0 )) && sleep "$STAGGER_SECS"
+
+    # claude 起動前に remain-on-exit を設定できるよう、まず保持コマンドで pane を作り、
+    # オプション設定後に respawn-pane で本来のコマンドへ差し替える。
+    # 起動後に設定すると、claude が即異常終了した場合に pane ごと消えて
+    # 原因確認できないレースがあるため
     if ! tmux has-session -t "=$TMUX_SESSION" 2>/dev/null; then
-      tmux new-session -d -s "$TMUX_SESSION" -c "$cwd" -n "$win" "$cmd_str" </dev/null
-      # claude が異常終了した場合だけ pane を残す（原因確認用）。未対応の tmux では無視
-      tmux set-option -t "$TMUX_SESSION" remain-on-exit failed 2>/dev/null || true
+      pane_id=$(tmux new-session -d -P -F '#{pane_id}' -s "$TMUX_SESSION" -c "$cwd" -n "$win" 'sleep 600' </dev/null) || pane_id=""
     else
-      tmux new-window -t "$TMUX_SESSION" -c "$cwd" -n "$win" "$cmd_str" </dev/null
+      pane_id=$(tmux new-window -t "$TMUX_SESSION" -P -F '#{pane_id}' -c "$cwd" -n "$win" 'sleep 600' </dev/null) || pane_id=""
     fi
-    ok "$label: 復帰しました（tmux window: $win）"
+    if [[ -z "$pane_id" ]]; then
+      err "$label: tmux のウィンドウ作成に失敗しました → skip"
+      (( skipped++ )) || true
+      continue
+    fi
+    # claude が異常終了した場合だけ pane を残す（原因確認用）。
+    # セッションターゲットへの set-option はカレントウィンドウにしか効かないため
+    # pane 単位で設定する。未対応の tmux では無視
+    tmux set-option -p -t "$pane_id" remain-on-exit failed 2>/dev/null || true
+    if ! tmux respawn-pane -k -t "$pane_id" "$cmd_str" 2>/dev/null; then
+      err "$label: claude の起動に失敗しました → skip"
+      tmux kill-pane -t "$pane_id" 2>/dev/null || true
+      (( skipped++ )) || true
+      continue
+    fi
+    pane_pid=$(tmux display-message -p -t "$pane_id" '#{pane_pid}' 2>/dev/null) || pane_pid=""
+    if [[ -z "$pane_pid" ]]; then
+      err "$label: 起動直後に pane が消えました → skip"
+      (( skipped++ )) || true
+      continue
+    fi
+    v_entries+=("${pane_pid}"$'\t'"$label")
+    ok "$label: 起動しました（tmux window: $win）"
     (( resumed++ )) || true
   done < "$MANIFEST"
 
   print
-  ok "完了: 復帰 $resumed 件 / skip $skipped 件"
-  if (( resumed > 0 && dry == 0 )); then
+  ok "完了: 起動 $resumed 件 / skip $skipped 件"
+  (( resumed > 0 && dry == 0 )) || return 0
+
+  # 起動成功 ≠ RC 登録成功。RC 登録は resume 後に非同期で行われ、credential の問題で
+  # 失敗・切断されることがあるため、状態ファイルの bridgeSessionId で実測確認する
+  if (( VERIFY_TIMEOUT > 0 )); then
+    print
+    print -- "── RC 登録の確認（最大 ${VERIFY_TIMEOUT} 秒待機） ──"
+    if wait_rc_registration "$VERIFY_TIMEOUT" "${v_entries[@]}"; then
+      print
+      ok "すべての会話の RC 登録を確認しました"
+      info "claude.ai/code または モバイルアプリに新しいセッションとして表示されます"
+    else
+      print
+      warn "RC 未登録の会話があります。以下で再接続を試してください:"
+      info "claude-rc-reattach reconnect"
+      info "（または tmux attach -t $TMUX_SESSION で該当ウィンドウを開き、手動で /remote-control を実行）"
+      return 1
+    fi
+  else
     print
     info "確認方法:"
     info "  tmux attach -t $TMUX_SESSION     # 各ウィンドウのフッターに /rc active が出ていれば成功"
     info "  claude.ai/code または モバイルアプリに新しいセッションとして表示されます"
   fi
+}
+
+# restore 後に RC が未登録・切断状態になったセッションへ /remote-control を送って再接続する
+#   対象は tmux セッション "$TMUX_SESSION" 内の pane のみ（通常のターミナルにはキーを送れない）
+cmd_reconnect() {
+  if (( $# )); then
+    err "reconnect にオプションはありません: $*"
+    return 1
+  fi
+  need python3
+  need_tmux || return 1
+
+  if ! tmux has-session -t "=$TMUX_SESSION" 2>/dev/null; then
+    err "tmux セッション '$TMUX_SESSION' がありません（restore で起動したセッションが対象です）"
+    return 1
+  fi
+
+  local rows
+  rows=$(tmux list-panes -s -t "=$TMUX_SESSION" -F '#{pane_pid} #{pane_dead} #{pane_id} #{window_name}')
+  if [[ -z "$rows" ]]; then
+    err "tmux セッション '$TMUX_SESSION' に pane がありません"
+    return 1
+  fi
+
+  typeset -A id_of win_of
+  local -a live_pids target_entries
+  local pane_pid pane_dead pane_id win_name st sid n_connected=0 n_missing=0 n_dead=0 sent=0 rc=0
+  live_pids=()
+  target_entries=()
+  print -r -- "$rows" | while read -r pane_pid pane_dead pane_id win_name; do
+    if [[ "$pane_dead" == 1 ]]; then
+      warn "$win_name: claude が終了しています → skip（tmux attach -t $TMUX_SESSION で pane のエラーを確認）"
+      (( n_dead++ )) || true
+      continue
+    fi
+    live_pids+=("$pane_pid")
+    id_of[$pane_pid]="$pane_id"
+    win_of[$pane_pid]="$win_name"
+  done
+  if (( ${#live_pids} == 0 )); then
+    err "生きている pane がありません"
+    return 1
+  fi
+
+  print -r -- "$(pane_rc_status "${live_pids[@]}")" | while IFS=$'\t' read -r pane_pid st sid; do
+    case "$st" in
+      connected)
+        info "${win_of[$pane_pid]}: RC 接続済み → skip"
+        (( n_connected++ )) || true ;;
+      pending)
+        # composer に /remote-control を打ち込んで実行させる。
+        # 入力とEnterを分けて送り、TUI がスラッシュコマンドを認識する時間を確保する
+        tmux send-keys -t "${id_of[$pane_pid]}" -- '/remote-control'
+        sleep 0.5
+        tmux send-keys -t "${id_of[$pane_pid]}" Enter
+        ok "${win_of[$pane_pid]}: /remote-control を送信しました"
+        target_entries+=("${pane_pid}"$'\t'"${win_of[$pane_pid]}")
+        (( sent++ )) || true ;;
+      missing)
+        warn "${win_of[$pane_pid]}: claude セッションを検出できません → skip"
+        (( n_missing++ )) || true ;;
+    esac
+  done
+
+  # 検出不能・終了済みの pane は reconnect では対処できない失敗として数える
+  # （restore が missing で reconnect を案内するため、ここで成功を装うと失敗が隠れる）
+  if (( sent == 0 )); then
+    print
+    if (( n_missing + n_dead > 0 )); then
+      warn "再接続を送信できる pane がありませんでした（接続済み $n_connected / 検出不能 $n_missing / 終了 $n_dead）"
+      info "tmux attach -t $TMUX_SESSION で各 pane の状態を確認してください"
+      return 1
+    fi
+    ok "再接続が必要な会話はありません（接続済み $n_connected 件）"
+    return 0
+  fi
+
+  if (( VERIFY_TIMEOUT > 0 )); then
+    print
+    print -- "── RC 登録の確認（最大 ${VERIFY_TIMEOUT} 秒待機） ──"
+    wait_rc_registration "$VERIFY_TIMEOUT" "${target_entries[@]}" || rc=1
+  else
+    print
+    info "各ウィンドウのフッターに /rc active が出ているか確認してください（tmux attach -t $TMUX_SESSION）"
+  fi
+  (( n_missing + n_dead > 0 )) && rc=1
+  return $rc
 }
 
 cmd_switch() {
@@ -350,6 +651,9 @@ cmd_switch() {
     shift
   done
   need claude
+  # tmux はステップ 4 の restore まで使わないが、logout 後に無いと気づくと
+  # 手遅れ（切り替えだけ完了して復帰できない）なので先に確認する
+  need_tmux || return 1
 
   print -- "── 1/4 RC 接続中の会話を保存 ──"
   cmd_save || return 1
@@ -359,8 +663,24 @@ cmd_switch() {
   print -- "上記の会話を開いているターミナル / クライアントをすべて終了してください。"
   print -- "（開いたままの会話は複製（--fork-session）として復帰します。同一セッションとして"
   print -- "  復帰させたい場合は必ず閉じてください。複製せず skip したい場合は --no-fork）"
-  local _ans
-  read -r "_ans?終了したら Enter（中断は Ctrl-C）: "
+  local _ans manifest_sids open_left
+  manifest_sids=$(grep -v '^#' "$MANIFEST" | cut -f1)
+  while :; do
+    read -r "_ans?終了したら Enter（中断は Ctrl-C）: "
+    # 閉じ忘れの検知: manifest に記録した会話がまだ開いたままなら列挙して確認する
+    open_left=$(scan_sessions open | while IFS=$'\t' read -r sid cwd name pid; do
+      print -r -- "$manifest_sids" | grep -qx -- "$sid" && print -- "  • ${name:-(無名)}  [$cwd]  pid=$pid"
+    done)
+    [[ -z "$open_left" ]] && break
+    print
+    warn "まだ開いたままの会話があります:"
+    print -r -- "$open_left"
+    warn "開いたまま切り替えると、元のプロセスは旧アカウントのトークン失効により RC が"
+    warn "credential エラー（code 4094 / 401）で切断され、復帰は複製になります。"
+    read -r "_ans?それでも続行する場合は y、閉じ直して再確認する場合は Enter: "
+    [[ "$_ans" == [yY]* ]] && break
+    print
+  done
 
   print
   print -- "── 3/4 アカウント切り替え ──"
@@ -389,6 +709,7 @@ COMMANDS:
   save               RC 接続中の会話を manifest に保存（切り替え「前」に実行）
   restore [options]  manifest の会話を tmux 内で resume して RC 再登録（切り替え「後」に実行）
   switch  [options]  save → logout → login → restore を一括実行
+  reconnect          tmux 内の RC 未登録セッションに /remote-control を送信して再接続
   help               このヘルプを表示
 
 RESTORE/SWITCH OPTIONS:
@@ -405,7 +726,11 @@ ENVIRONMENT:
                            （例: "--dangerously-skip-permissions"）
                            権限モードを指定した場合は自動引き継ぎより優先される
   CLAUDE_RC_MAX_AGE_DAYS   最終チャットからこの日数を超えた会話は restore で skip する
-                           （既定: 7。0 で無効化）
+                           （既定: 3。0 で無効化）
+  CLAUDE_RC_VERIFY_TIMEOUT restore / reconnect 後に RC 登録を確認する最大秒数
+                           （既定: 60。0 で確認しない）
+  CLAUDE_RC_STAGGER_SECS   restore で各セッションを起動する間隔の秒数
+                           （既定: 3。credential の同時発行・同時失効の緩和用。0 で無効化）
 EOF
 }
 
@@ -414,6 +739,7 @@ case "${1:-help}" in
   save)      shift; cmd_save "$@" ;;
   restore)   shift; cmd_restore "$@" ;;
   switch)    shift; cmd_switch "$@" ;;
+  reconnect) shift; cmd_reconnect "$@" ;;
   -h|--help|help) usage ;;
   -v|--version)   print -- "$VERSION" ;;
   *) err "不明なコマンド: $1"; print; usage; exit 1 ;;

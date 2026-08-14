@@ -18,7 +18,15 @@ claude auth login
 claude-rc-reattach restore
 ```
 
-restore が終わったら、次で成功を確認できます:
+restore は起動後に各会話の RC 登録を自動確認し（既定で最大 60 秒）、会話ごとに ✔ / ⚠ を表示します。
+tmux ウィンドウの起動成功と RC 登録の成功は別物のため、bridgeSessionId の書き込みを実測で確認しています。
+⚠ が残った場合は次で再接続を試せます:
+
+```bash
+claude-rc-reattach reconnect
+```
+
+手動で確認したい場合:
 
 ```bash
 tmux attach -t rc-restore
@@ -34,9 +42,9 @@ tmux attach -t rc-restore
 
 | 要件 | 補足 |
 |---|---|
-| macOS | Claude Code v2.1.220 で検証（Linux は動く見込みだが未検証） |
+| macOS | Claude Code v2.1.232 で検証（Linux は動く見込みだが未検証） |
 | Claude Code v2.1.200 以降 | |
-| tmux | `brew install tmux` |
+| tmux | `brew install tmux`。restore / switch / reconnect で必要（無い場合は実行時にインストール方法を案内して停止します。list / save は tmux 不要） |
 | python3 | Xcode Command Line Tools に付属 |
 | Pro / Max / Team / Enterprise プラン | Remote Control の利用条件 |
 
@@ -79,8 +87,9 @@ resume したセッションが自動的に RC 登録されるようになりま
 |---|---|---|
 | `list` | いつでも | RC 接続中の会話を一覧表示（save 対象の事前確認用） |
 | `save` | 切り替え**前** | RC 接続中の会話を manifest ファイルに記録 |
-| `restore` | 切り替え**後**（ログイン済み） | manifest の各会話を tmux 内で resume し、RC 再登録 |
+| `restore` | 切り替え**後**（ログイン済み） | manifest の各会話を tmux 内で resume し、RC 再登録と登録確認まで行う |
 | `switch` | — | save → logout → login → restore を対話形式で一括実行 |
+| `reconnect` | restore 後いつでも | tmux 内の RC 未登録セッションに `/remote-control` を送信して再接続 |
 
 ### switch（一括実行）
 
@@ -93,9 +102,10 @@ claude-rc-reattach switch
 
 1. **save** — RC 接続中の会話を manifest に記録
 2. **セッション終了の確認** — 会話を開いているターミナル / クライアントを閉じて Enter
-   （開いたままでも復帰はできますが、その会話は「複製」として復帰します。詳細は下記）
+   （Enter 時に閉じ忘れを自動検知し、まだ開いている会話があれば列挙して再確認します。
+   開いたままでも復帰はできますが、その会話は「複製」として復帰します。詳細は下記）
 3. **アカウント切り替え** — `claude auth logout` 後、新アカウントで対話ログイン
-4. **restore** — 各会話を tmux セッション `rc-restore` 内で resume
+4. **restore** — 各会話を tmux セッション `rc-restore` 内で resume し、RC 登録を自動確認
 
 ### オプション（restore / switch 共通）
 
@@ -114,6 +124,27 @@ claude-rc-reattach switch
 **古い会話は復帰対象外（既定 = 最終チャットから 3 日以内のみ）**:
 会話ログの最終エントリが 3 日より前の会話は、放置されたものとみなして restore で skip します。
 上限日数は環境変数 `CLAUDE_RC_MAX_AGE_DAYS` で変更でき、`0` にするとこのチェック自体を無効化できます。
+
+### RC 登録の自動確認と reconnect
+
+tmux ウィンドウの起動成功と RC 登録の成功は別物です。
+RC 登録は resume されたプロセスが起動後に非同期で行うため、restore は各セッションの状態ファイル（`~/.claude/sessions/<PID>.json`）に `bridgeSessionId` が書き込まれるのを実測で確認してから ✔ を表示します（既定で最大 60 秒。`CLAUDE_RC_VERIFY_TIMEOUT` で変更、`0` で無効化）。
+claude が異常終了した場合は pane を残し（tmux 3.2 以降）、その旨を表示します。
+
+また、復帰直後は `/rc active` でも、**しばらく経ってから credential の更新失敗で RC だけが切断されることがあります**（下記トラブルシューティング参照）。
+その場合は `reconnect` で一括再接続できます:
+
+```bash
+claude-rc-reattach reconnect
+# tmux セッション rc-restore 内の各ウィンドウの RC 状態を調べ、
+# 未登録のものにだけ /remote-control を送信 → 登録を再確認します
+```
+
+reconnect の対象は tmux セッション（既定: `rc-restore`）内の pane のみです。
+通常のターミナルで開いているセッションにはキー送信ができないため、そちらは手動で `/remote-control` を実行してください。
+また、対象ウィンドウの入力欄に入力中の文字が残っていると送信内容が混ざるため、入力欄は空にしておいてください。
+
+restore はセッションの同時起動による credential の同時発行・同時失効を緩和するため、各ウィンドウの起動間隔を既定で 3 秒空けます（`CLAUDE_RC_STAGGER_SECS` で変更、`0` で無効化）。
 
 ### 権限モードの引き継ぎ（--dangerously-skip-permissions 等）
 
@@ -173,6 +204,8 @@ CLAUDE_RC_CLAUDE_ARGS="--dangerously-skip-permissions --append-system-prompt '�
 | `CLAUDE_RC_TMUX_SESSION` | `rc-restore` | 復帰先の tmux セッション名 |
 | `CLAUDE_RC_CLAUDE_ARGS` | （なし） | restore 時に `claude` コマンドへ追加するオプション（スペース区切りで複数可。値にスペースを含む場合は `'...'` か `"..."` で囲む） |
 | `CLAUDE_RC_MAX_AGE_DAYS` | `3` | 最終チャットからこの日数を超えた会話は restore で skip する（`0` で無効化） |
+| `CLAUDE_RC_VERIFY_TIMEOUT` | `60` | restore / reconnect 後に RC 登録を確認する最大秒数（`0` で確認しない） |
+| `CLAUDE_RC_STAGGER_SECS` | `3` | restore で各セッションを起動する間隔の秒数（credential の同時発行・同時失効の緩和用。`0` で無効化） |
 
 ## 仕組み
 
@@ -198,6 +231,12 @@ RC 接続中かどうかは、Claude Code が実行中セッションごとに�
 - **RC セッション ID は新規になります。**
   claude.ai/code 上では「新しいセッション」として表示されます（会話の中身は継続）。
   旧アカウント側のセッション一覧には非アクティブなエントリが残りますが、これは仕様上消せません
+- **復帰後も RC が切断されることがあります。**
+  RC は接続後も短命の credential を定期更新しており、更新失敗（トークン失効・並行セッションの refresh 競合など）で切断されることがあります。
+  restore の確認が ✔ でも後から切断され得るため、切れていたら `reconnect` を実行してください
+- **デスクトップ版 / IDE 拡張のセッションも save の検出対象になりますが、復帰先は常に tmux 内の CLI セッションです。**
+  検出はセッション状態ファイルの `kind: "interactive"` で判定しており、起動元（entrypoint）は問いません。
+  復帰した会話をデスクトップ版で続けたい場合は、復帰後にデスクトップ側で同じ会話を開き直してください
 - **`claude auth login` だけは対話操作が必須**です。
   環境変数やトークンで代替する手段はありません（`claude setup-token` のトークンでは RC を張れないことが公式ドキュメントに明記されています）
 - **複製（fork）復帰した会話は元の会話と分岐します。**
@@ -208,7 +247,7 @@ RC 接続中かどうかは、Claude Code が実行中セッションごとに�
 - **権限モードの検出は `ps` の起動引数から行うため、引用符の情報は失われます。**
   `--append-system-prompt "... --permission-mode plan ..."` のように他オプションの値の中に権限フラグと同じ語が含まれていると、誤って権限モードとして検出することがあります。
   その場合は `--no-inherit-perms` で引き継ぎを無効化してください
-- `~/.claude/sessions/<PID>.json` は非公開の内部仕様です（v2.1.220 で動作検証）。
+- `~/.claude/sessions/<PID>.json` は非公開の内部仕様です（v2.1.232 で動作検証）。
   Claude Code のアップデートで形式が変わる可能性があります。
   動かなくなったら `claude-rc-reattach list` の結果と `ls ~/.claude/sessions/` を見比べてください
 
@@ -217,7 +256,8 @@ RC 接続中かどうかは、Claude Code が実行中セッションごとに�
 | 症状 | 確認すること |
 |---|---|
 | `list` に何も出ない | 各セッションのフッターに `/rc active` が出ているか。出ていなければそのセッションは RC 未接続（`/remote-control` で手動接続するか、`remoteControlAtStartup: true` を設定して開き直す） |
-| restore 後に `/rc active` が出ない | `claude doctor` で RC の適格性チェックを確認。`ANTHROPIC_API_KEY` が環境にセットされていると RC が無効になるため `unset` する |
+| restore 後に `/rc active` が出ない | restore の RC 登録確認で ⚠ になった会話は `claude-rc-reattach reconnect` で再接続を試す。それでもだめなら `claude doctor` で RC の適格性チェックを確認。`ANTHROPIC_API_KEY` が環境にセットされていると RC が無効になるため `unset` する |
+| 復帰後しばらくして `Remote Control disconnected — Transport closed: worker credential expired or rejected (code 4094)` や `could not fetch fresh session credentials after code 401` が出る | RC の worker credential 更新に失敗して切断された状態。旧アカウントのまま開き続けたセッションでは logout によるトークン失効のため必ず発生する（そのセッションの RC は復旧不可。新アカウントで開き直す）。同一アカウントでも複数セッション並行時の OAuth refresh 競合で発生することがある Claude Code 側の既知問題（[#54443](https://github.com/anthropics/claude-code/issues/54443) / [#61912](https://github.com/anthropics/claude-code/issues/61912) / [#78309](https://github.com/anthropics/claude-code/issues/78309)）。tmux 内のセッションなら `claude-rc-reattach reconnect`、通常のターミナルなら該当セッションで `/remote-control` を実行して再接続する |
 | ウィンドウがすぐ落ちる | tmux 3.2 以降なら異常終了した pane が残るので、そこにエラーが表示されています。`tmux attach -t rc-restore` で確認 |
 | 「会話ログが見つかりません」で skip される | 該当プロジェクトの `~/.claude/projects/<エンコード名>/<sessionId>.jsonl` が存在するか確認 |
 | 「別プロセスで開いたままです」で skip される | `--no-fork` を付けた場合の動作です。外せば複製として復帰します（既定） |
