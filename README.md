@@ -99,6 +99,7 @@ restore は `claude --resume <sessionId> --remote-control <会話名>` の形で
 | `save` | 切り替え**前** | RC 接続中の会話を manifest ファイルに記録 |
 | `restore` | 切り替え**後**（ログイン済み） | manifest の各会話を tmux 内で resume し、RC 再登録と登録確認まで行う |
 | `switch` | — | save → logout → login → restore を対話形式で一括実行 |
+| `recover` | save し損ねた時 | manifest を使わず、直近に更新された会話ログから復旧候補を探して resume |
 | `reconnect` | restore 後いつでも | tmux 内の RC 未登録セッションに `/remote-control` を送信して再接続（`--recap` 可） |
 
 ### switch（一括実行）
@@ -121,7 +122,9 @@ claude-rc-reattach switch
 
 | オプション | 動作 |
 |---|---|
-| `--no-fork` | 元プロセスが開いたままの会話を複製せず skip する |
+| `--force` | すでに動いている会話も復帰させる（既定は skip） |
+| `--no-fork` | `--force` 時、元プロセスが開いたままの会話を複製せず skip する |
+| `--no-rename` | 復帰セッションに `-restored-MMDD` の名前を付けない |
 | `--no-inherit-perms` | save 時に検出した権限モードを引き継がない |
 | `--inherit-bypass` | bypass 系の権限モードも引き継ぐ（既定では引き継がない。後述） |
 | `--recap` | RC 登録できた会話に「経緯を要約して」を 1 通送る（リモート側に文脈を残すため。`reconnect` でも使える） |
@@ -135,11 +138,30 @@ claude-rc-reattach switch
 | `1` | 1 件も復帰できなかった、または RC 登録を確認できなかった |
 | `2` | 一部の会話を skip した（部分成功） |
 
-**元プロセスが開いたままの会話の扱い（既定 = 複製復帰）**:
-同じ会話を 2 つのプロセスで同時に開くと会話ログへの多重書き込みが起きるため、開いたままの会話は既定で `--fork-session` を付けて「複製」として復帰します。
-元の会話は変更されません。
-ただし複製後は 2 つの会話が別々に進むため、**同一の会話として復帰させたい場合は、restore の前に元のターミナルを閉じてください**。
-複製も作りたくない場合は `--no-fork` を付けると該当の会話を skip します。
+**すでに動いている会話は復帰させない（重複ガード / 既定）**:
+restore を 2 回実行したり、一部の会話を手で開き直した後に restore すると、同じ会話がいくつも立ち上がってしまいます。
+これを防ぐため、restore は各会話について次の 2 つを調べ、どちらかに当てはまる会話を `skip (already running)` として飛ばします。
+
+1. `~/.claude/sessions/*.json` のうち **PID が生きている**ものの `sessionId` が一致する（その会話が開かれている）
+2. 実行中プロセスのコマンドラインに `--resume <対象の sessionId>` がある（その会話の resume / 複製がすでに動いている）
+
+2 は複製復帰した会話を拾うためのものです（`--fork-session` で復帰すると走っているプロセス自身の sessionId は別物になり、1 だけでは検出できません）。
+
+```
+$ claude-rc-reattach restore
+  skip (already running): my-project
+```
+
+**開いたままの会話も強制的に復帰させたい場合（`--force`）**:
+`--force` を付けると従来どおり復帰します。
+同じ会話を 2 つのプロセスで同時に開くと会話ログへの多重書き込みが起きるため、この場合は `--fork-session` を付けた「複製」として復帰します（元の会話は変更されません）。
+複製後は 2 つの会話が別々に進むため、**同一の会話として復帰させたい場合は、restore の前に元のターミナルを閉じてください**。
+複製も作りたくない場合は `--force --no-fork` で該当の会話を skip します。
+
+**復帰セッションには名前が付きます（既定）**:
+復帰した会話は `claude -n "<元の名前の先頭 20 文字>-restored-MMDD"` で起動するため、claude.ai/code の一覧で元の会話と区別できます（例: `あすまるくん改修-immutable-c-restored-0815`）。
+`-n` に未対応の古い claude では、その旨を表示して名前なしで起動します。
+名前を付けたくない場合は `--no-rename` を付けてください。
 
 **RC は起動時に明示します**:
 restore は `claude --resume <sessionId> --remote-control <会話名>` で起動します。
@@ -220,6 +242,54 @@ claude-rc-reattach restore --recap
 プロンプトは環境変数 `CLAUDE_RC_RECAP_PROMPT` で変更できます（送信後すぐ Enter を打つため、必ず 1 行で書いてください）。
 `reconnect` と同じくキー送信で行うため、**対象ウィンドウの入力欄は空にしておいてください**。
 
+### recover（save し損ねた時の復旧）
+
+Mac のクラッシュや強制終了で `save` する前にセッションが全滅した場合、manifest がないため restore は使えません。
+`recover` は manifest の代わりに**会話ログそのもの**（`~/.claude/projects/*/<sessionId>.jsonl`）を見て、「直近に更新された & いま動いていない」会話を復旧候補として拾います。
+
+```bash
+# まず候補を確認する（起動はしない）
+claude-rc-reattach recover --dry-run
+
+# 直近 12 時間まで広げる
+claude-rc-reattach recover --within 12 --dry-run
+
+# 実際に復帰させる
+claude-rc-reattach recover
+```
+
+```
+$ claude-rc-reattach recover --dry-run
+復旧候補（直近 6 時間・実行中のものを除く）:
+[/Users/me/dev/my-project]
+✔ [dry-run] 2026-08-15 21:10  bb3a9965-...  my-project: 検索クエリを作って
+  → claude --resume bb3a9965-... -n 'my-project: 検索クエ-restored-0815'
+```
+
+- 対象は既定で**直近 6 時間**以内に更新された会話（`--within <時間>` / `CLAUDE_RC_RECOVER_HOURS` で変更）
+- restore と同じ判定で**いま動いている会話は除外**します
+- サブエージェントのログ（`subagents/` 配下・`agent-*`）と、発言が 1 つも無い空のログは候補にしません
+- 同じプロジェクトに複数候補がある場合は、最終更新が新しい順に表示します
+- 復帰先は restore と同じ tmux セッション（既定: `rc-restore`）で、セッション名も同じ規則（`-restored-MMDD`）で付きます
+
+| オプション | 動作 |
+|---|---|
+| `--within <hours>` | 対象とする時間（既定: 6） |
+| `--auto-confirm` | 起動後の確認ダイアログに Enter を自動送信 |
+| `--no-rename` | 復帰セッションに名前を付けない |
+| `--dry-run` | 候補一覧だけ表示して起動しない |
+
+**確認ダイアログについて**:
+recover は manifest 経由ではないため、起動後に trust 確認（`Do you trust the files in this folder?`）や「Resume from summary」のダイアログで止まることがあります。
+起動から少し待って（既定 10 秒 / `CLAUDE_RC_CONFIRM_WAIT`）各ウィンドウを覗き、ダイアログが出ていれば件数を表示します:
+
+```
+⚠ 2 個のセッションが確認ダイアログ待ちです。--auto-confirm で自動応答できます
+```
+
+`--auto-confirm` を付けると Enter を自動送信して進めます（既定の選択肢を選ぶため、最大 3 段まで）。
+**どのフォルダを信頼するかを自動承認することになるため、身に覚えのないディレクトリが候補に出ていないかを `--dry-run` で確認してから使ってください。**
+
 ### 権限モードの引き継ぎ（--dangerously-skip-permissions 等）
 
 `--dangerously-skip-permissions` などの権限モードは、会話ではなく**プロセス起動時の状態**のため、`--resume` では引き継がれません。
@@ -290,6 +360,8 @@ CLAUDE_RC_CLAUDE_ARGS="--dangerously-skip-permissions --append-system-prompt '�
 | `CLAUDE_RC_VERIFY_TIMEOUT` | `60` | restore / reconnect 後に RC 登録を確認する最大秒数（`0` で確認しない） |
 | `CLAUDE_RC_STAGGER_SECS` | `3` | restore で各セッションを起動する間隔の秒数（credential の同時発行・同時失効の緩和用。`0` で無効化） |
 | `CLAUDE_RC_RECAP_PROMPT` | `これまでの会話の経緯と、いま取り組んでいることを 5 行以内で要約してください。` | `--recap` で送るプロンプト（必ず 1 行で書くこと） |
+| `CLAUDE_RC_RECOVER_HOURS` | `6` | recover が対象とする時間（`--within` を付けた場合はそちらが優先） |
+| `CLAUDE_RC_CONFIRM_WAIT` | `10` | recover で確認ダイアログを見に行くまでの待ち秒数 |
 
 ## 仕組み
 
@@ -311,6 +383,9 @@ save: RC接続中の会話を記録    →    restore: 各会話を claude --res
 RC 接続中かどうかは、Claude Code が実行中セッションごとに書き出す `~/.claude/sessions/<PID>.json` の `bridgeSessionId` フィールドの有無で判定しています。
 
 権限モードはこの状態ファイルには含まれないため、save 時に同ファイルの `pid` から `ps` で起動引数を読み、権限関連のフラグだけを manifest に記録しています。
+
+`recover` は manifest も状態ファイルも使わず、会話ログ（`~/.claude/projects/*/<sessionId>.jsonl`）の更新時刻を直接見ます。
+状態ファイルは Claude Code の終了時に消えるため、クラッシュ後に残っているのは会話ログだけ、という前提の復旧経路です。
 
 ## 制約・知っておくべきこと
 
@@ -353,7 +428,9 @@ RC 接続中かどうかは、Claude Code が実行中セッションごとに�
 | 復帰後しばらくして `Remote Control disconnected — Transport closed: worker credential expired or rejected (code 4094)` や `could not fetch fresh session credentials after code 401` が出る | RC の worker credential 更新に失敗して切断された状態。旧アカウントのまま開き続けたセッションでは logout によるトークン失効のため必ず発生する（そのセッションの RC は復旧不可。新アカウントで開き直す）。同一アカウントでも複数セッション並行時の OAuth refresh 競合で発生することがある Claude Code 側の既知問題（[#54443](https://github.com/anthropics/claude-code/issues/54443) / [#61912](https://github.com/anthropics/claude-code/issues/61912) / [#78309](https://github.com/anthropics/claude-code/issues/78309)）。tmux 内のセッションなら `claude-rc-reattach reconnect`、通常のターミナルなら該当セッションで `/remote-control` を実行して再接続する |
 | ウィンドウがすぐ落ちる | tmux 3.2 以降なら異常終了した pane が残るので、そこにエラーが表示されています。`tmux attach -t rc-restore` で確認 |
 | 「会話ログが見つかりません」で skip される | `~/.claude/projects/*/<sessionId>.jsonl` が存在するか確認（規則どおりの場所に無い場合は projects 配下を総当たりで探します） |
-| 「別プロセスで開いたままです」で skip される | `--no-fork` を付けた場合の動作です。外せば複製として復帰します（既定） |
+| `skip (already running)` で skip される | その会話はすでに開かれている（または復帰済み）ため、二重起動を防いで飛ばしています。それでも復帰させたい場合は `--force` |
+| 「別プロセスで開いたままです」で skip される | `--force --no-fork` を付けた場合の動作です。`--no-fork` を外せば複製として復帰します |
+| save し損ねたまま Mac がクラッシュした | `claude-rc-reattach recover --dry-run` で復旧候補を確認し、問題なければ `recover` を実行（上記「recover」参照） |
 | 「最終チャットが N 日前」で skip される | `CLAUDE_RC_MAX_AGE_DAYS` に 1 以上を指定した場合の動作です。既定（`0`）では古い会話も復帰します |
 | 復帰後に `--dangerously-skip-permissions` が外れている | bypass 系は既定で引き継ぎません。`--inherit-bypass` を付けるか、`CLAUDE_RC_CLAUDE_ARGS` で明示指定してください。セッション中に `/permissions` で変更した場合は検出できません（上記「権限モードの引き継ぎ」参照） |
 | スマホ / claude.ai/code に切り替え前のやりとりが出ない | 仕様です（Claude Code のクロスアカウント抑止）。`--recap` を付けて実行するか、復帰したセッションで要約を 1 通送ってください（上記「[リモート側に切り替え前の履歴は表示されない](#リモート側に切り替え前の履歴は表示されない)」参照） |

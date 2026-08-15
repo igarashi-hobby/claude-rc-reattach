@@ -17,12 +17,16 @@ STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/claude-rc-reattach"
 MANIFEST="${CLAUDE_RC_MANIFEST:-$STATE_DIR/manifest.tsv}"
 TMUX_SESSION="${CLAUDE_RC_TMUX_SESSION:-rc-restore}"
 SESSIONS_DIR="$HOME/.claude/sessions"
+PROJECTS_DIR="$HOME/.claude/projects"
 # save が記録するのは「実行中かつ RC 接続中」の会話だけなので、最終チャットが古くても
 # 放置された会話とは限らない。既定では日数で捨てず、古い場合に一言添えるだけにする
 # （0 = skip しない。1 以上を指定するとその日数を超えた会話を skip する）
 MAX_AGE_DAYS="${CLAUDE_RC_MAX_AGE_DAYS:-0}"
 VERIFY_TIMEOUT="${CLAUDE_RC_VERIFY_TIMEOUT:-60}"
 STAGGER_SECS="${CLAUDE_RC_STAGGER_SECS:-3}"
+RECOVER_HOURS="${CLAUDE_RC_RECOVER_HOURS:-6}"
+CONFIRM_WAIT="${CLAUDE_RC_CONFIRM_WAIT:-10}"
+CONFIRM_PENDING=0   # handle_confirm_dialogs の結果（ダイアログ待ちの pane 数）
 # --recap で送るプロンプト。復帰後の RC セッションには切り替え前の履歴が送られない
 # （Claude Code のクロスアカウント抑止）ため、要約を 1 通送って文脈をリモートに残す。
 # 送信後すぐ Enter を打つので、必ず 1 行で書くこと
@@ -35,17 +39,25 @@ ok()   { print -- "✔ $*"; }
 
 # 数値系の環境変数は不正値なら既定値に戻す
 # （非数値のまま (( )) で比較すると zsh が実行時エラーを出し、チェックが素通りするため）
-if [[ "$MAX_AGE_DAYS" != <-> ]]; then
+if [[ ! "$MAX_AGE_DAYS" =~ ^[0-9]+$ ]]; then
   warn "CLAUDE_RC_MAX_AGE_DAYS='$MAX_AGE_DAYS' は数値ではないため既定値 0（skip しない）を使います"
   MAX_AGE_DAYS=0
 fi
-if [[ "$VERIFY_TIMEOUT" != <-> ]]; then
+if [[ ! "$VERIFY_TIMEOUT" =~ ^[0-9]+$ ]]; then
   warn "CLAUDE_RC_VERIFY_TIMEOUT='$VERIFY_TIMEOUT' は数値ではないため既定値 60 を使います"
   VERIFY_TIMEOUT=60
 fi
-if [[ "$STAGGER_SECS" != <-> ]]; then
+if [[ ! "$STAGGER_SECS" =~ ^[0-9]+$ ]]; then
   warn "CLAUDE_RC_STAGGER_SECS='$STAGGER_SECS' は数値ではないため既定値 3 を使います"
   STAGGER_SECS=3
+fi
+if [[ ! "$RECOVER_HOURS" =~ ^[0-9]+$ ]]; then
+  warn "CLAUDE_RC_RECOVER_HOURS='$RECOVER_HOURS' は数値ではないため既定値 6 を使います"
+  RECOVER_HOURS=6
+fi
+if [[ ! "$CONFIRM_WAIT" =~ ^[0-9]+$ ]]; then
+  warn "CLAUDE_RC_CONFIRM_WAIT='$CONFIRM_WAIT' は数値ではないため既定値 10 を使います"
+  CONFIRM_WAIT=10
 fi
 
 # tmux はセッション名の . と : を _ に置き換えて保存するため、そのままだと
@@ -153,6 +165,23 @@ for path in sorted(glob.glob(os.path.join(sessions_dir, "*.json"))):
     seen.add(sid)
     print("\t".join([sid, cwd, (d.get("name") or "").replace("\t", " ").replace("\n", " "), str(pid)]))
 PY
+}
+
+# いま開かれている会話の sessionId を重複なしで列挙する（同じ会話の二重起動を防ぐため）
+#   1) ~/.claude/sessions/*.json（PID が生きているもの）の sessionId
+#   2) 実行中プロセスのコマンドライン中の `--resume <sessionId>`
+#      → --fork-session で複製した場合、走っている claude 本人の sessionId は別物になるため、
+#        状態ファイルだけでは「その会話の復帰がもう動いている」ことを検出できない
+running_session_ids() {
+  {
+    scan_sessions open | cut -f1
+    ps -ax -o args= 2>/dev/null | python3 -c '
+import re, sys
+pat = re.compile(r"(?:--resume|-r)(?:=|\s+)([0-9a-fA-F-]{36})")
+for line in sys.stdin:
+    for sid in pat.findall(line):
+        print(sid)'
+  } | sort -u
 }
 
 # tmux の pane_pid ごとに、その配下で動く claude セッションの RC 状態を TSV で返す
@@ -393,7 +422,7 @@ find_transcript() {
     print -r -- "$p"
     return 0
   fi
-  hits=("$HOME/.claude/projects"/*/"$sid.jsonl"(N))
+  eval 'hits=("$HOME/.claude/projects"/*/"$sid.jsonl"(N))'
   if (( ${#hits} )); then
     print -r -- "${hits[1]}"
     return 0
@@ -507,6 +536,160 @@ detect_perm_flags() {
   print -r -- "${out[*]}"
 }
 
+# この claude が -n / --name（セッションの表示名指定）に対応しているか
+claude_supports_name() {
+  claude --help 2>/dev/null | grep -q -- '--name'
+}
+
+# 復帰セッションに付ける表示名（Remote Control の一覧で復元品を見分けるため）
+#   例: あすまるくん改修-immutable-cre-restored-0815
+restored_session_name() {
+  local prefix
+  eval 'prefix="${1[1,20]}"'
+  print -r -- "${prefix}-restored-$(date '+%m%d')"
+}
+
+# tmux セッション "$TMUX_SESSION" に窓を作って claude を起動し、"pane_id<TAB>pane_pid" を返す
+#   失敗時は err を出して非 0（呼び出し側は skip 扱いにする）
+launch_pane() {
+  local label="$1" win="$2" cwd="$3" cmd_str="$4" sid="${5:-}"
+  local pane_id pane_pid
+  # claude 起動前に remain-on-exit を設定できるよう、まず保持コマンドで pane を作り、
+  # オプション設定後に respawn-pane で本来のコマンドへ差し替える。
+  # 起動後に設定すると、claude が即異常終了した場合に pane ごと消えて
+  # 原因確認できないレースがあるため
+  if ! tmux has-session -t "=$TMUX_SESSION" 2>/dev/null; then
+    pane_id=$(tmux new-session -d -P -F '#{pane_id}' -s "$TMUX_SESSION" -c "$cwd" -n "$win" 'sleep 600' </dev/null) || pane_id=""
+  else
+    pane_id=$(tmux new-window -t "$TMUX_SESSION" -P -F '#{pane_id}' -c "$cwd" -n "$win" 'sleep 600' </dev/null) || pane_id=""
+  fi
+  if [[ -z "$pane_id" ]]; then
+    err "$label: tmux のウィンドウ作成に失敗しました → skip"
+    return 1
+  fi
+  # claude が異常終了した場合だけ pane を残す（原因確認用）。
+  # セッションターゲットへの set-option はカレントウィンドウにしか効かないため
+  # pane 単位で設定する。未対応の tmux では無視
+  tmux set-option -p -t "$pane_id" remain-on-exit failed 2>/dev/null || true
+  # このツールが起動した pane であることと、どの会話かを pane に記録する。
+  # restore / recover の再実行で二重起動しないため／reconnect が無関係な pane にキーを送らないため
+  [[ -n "$sid" ]] && tmux set-option -p -t "$pane_id" '@rc_sid' "$sid" 2>/dev/null || true
+  if ! tmux respawn-pane -k -t "$pane_id" "$cmd_str" 2>/dev/null; then
+    err "$label: claude の起動に失敗しました → skip"
+    tmux kill-pane -t "$pane_id" 2>/dev/null || true
+    return 1
+  fi
+  pane_pid=$(tmux display-message -p -t "$pane_id" '#{pane_pid}' 2>/dev/null) || pane_pid=""
+  if [[ -z "$pane_pid" ]]; then
+    err "$label: 起動直後に pane が消えました → skip"
+    return 1
+  fi
+  print -r -- "${pane_id}"$'\t'"${pane_pid}"
+}
+
+# manifest が無くても復帰できるよう、会話ログから復旧候補を列挙する
+#   引数: 対象時間（h）, 除外する sessionId（いま動いているもの）...
+#   出力: 最終更新<TAB>sessionId<TAB>cwd<TAB>プロジェクト<TAB>推定タイトル
+#         （プロジェクト単位・最終更新の新しい順）
+scan_recoverable() {
+  local hours="$1"; shift
+  python3 - "$PROJECTS_DIR" "$hours" "$@" <<'PY'
+import glob, json, os, re, sys, time
+from datetime import datetime
+
+projects_dir, hours = sys.argv[1], int(sys.argv[2])
+running = set(sys.argv[3:])
+cutoff = time.time() - hours * 3600
+uuid_re = re.compile(r"^[0-9a-fA-F-]{36}$")
+cwd_re = re.compile(r'"cwd"\s*:\s*"([^"]+)"')
+
+def probe(path):
+    """先頭 256KB からタイトル・cwd・発言の有無を拾う
+    （会話ログは数十 MB になり得るため全部は読まない）"""
+    title = cwd = ""
+    has_message = False
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            head = f.read(262144)
+    except OSError:
+        return title, cwd, has_message
+    m = cwd_re.search(head)
+    if m:
+        cwd = m.group(1)
+    for line in head.splitlines():
+        try:
+            d = json.loads(line)
+        except Exception:
+            continue
+        t = d.get("type")
+        if t in ("user", "assistant"):
+            has_message = True
+        if t in ("custom-title", "agent-name") and not title:
+            title = d.get("customTitle") or d.get("agentName") or ""
+        # 名前が付いていない会話は、最初のユーザー発言の冒頭をタイトル代わりにする
+        if not title and t == "user" and not d.get("isSidechain"):
+            c = d.get("message", {}).get("content")
+            if isinstance(c, list):
+                c = " ".join(p.get("text", "") for p in c if isinstance(p, dict))
+            if isinstance(c, str):
+                title = c
+    return " ".join(title.split())[:40], cwd, has_message
+
+rows = []
+for path in glob.glob(os.path.join(projects_dir, "*", "*.jsonl")):
+    name = os.path.basename(path)
+    # サブエージェントのログは会話そのものではないので対象外
+    if "/subagents/" in path or name.startswith("agent-"):
+        continue
+    sid = name[: -len(".jsonl")]
+    if not uuid_re.match(sid) or sid in running:
+        continue
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        continue
+    if mtime < cutoff:
+        continue
+    title, cwd, has_message = probe(path)
+    # 発言が 1 つも無いログ（タイトル行だけ残った空セッション等）は復帰しても意味がない
+    if not has_message:
+        continue
+    rows.append((os.path.basename(os.path.dirname(path)), -mtime, sid, cwd, title))
+
+for proj, negmtime, sid, cwd, title in sorted(rows):
+    when = datetime.fromtimestamp(-negmtime).strftime("%Y-%m-%d %H:%M")
+    print("\t".join([when, sid, cwd, proj, title]))
+PY
+}
+
+# 起動直後の確認ダイアログ（trust 確認 / Resume from summary）を検出する
+#   auto=1 なら Enter を送って進める（連続する最大 3 段まで）。auto=0 なら検出のみ。
+#   結果（ダイアログ待ちのまま残った pane の数）は CONFIRM_PENDING に入れる
+#   （進捗表示を出すため、標準出力では返さない）
+handle_confirm_dialogs() {
+  local auto="$1"; shift
+  local -a entries
+  entries=("$@")
+  local e pane_id label out step pending=0
+  for e in "${entries[@]}"; do
+    pane_id="${e%%$'\t'*}"
+    label="${e#*$'\t'}"
+    # 4 周目は「3 回送っても消えないダイアログ」を待ち扱いにするための確認だけ
+    for step in 1 2 3 4; do
+      out=$(tmux capture-pane -p -t "$pane_id" 2>/dev/null) || break
+      [[ "$out" != *"Enter to confirm"* ]] && break
+      if (( ! auto || step > 3 )); then
+        (( pending++ )) || true
+        break
+      fi
+      tmux send-keys -t "$pane_id" Enter
+      info "$label: 確認ダイアログに Enter を送信しました（${step} 段目）"
+      sleep 2
+    done
+  done
+  CONFIRM_PENDING=$pending
+}
+
 cmd_list() {
   need python3
   local rows
@@ -521,7 +704,7 @@ cmd_list() {
   # IFS=$'\t' read は連続タブを 1 個に畳むため、name が空だと列がずれる。
   # (@ps:\t:) なら空フィールドがそのまま残る
   print -r -- "$rows" | while IFS= read -r line; do
-    f=("${(@ps:\t:)line}")
+    eval 'f=("${(@ps:\t:)line}")'
     sid="${f[1]:-}"; cwd="${f[2]:-}"; name="${f[3]:-}"; pid="${f[4]:-}"
     [[ -z "$sid" ]] && continue
     # 既にクロスアカウント抑止が付いた会話は、復帰してもリモートに履歴が出ない
@@ -547,7 +730,7 @@ cmd_save() {
   local rows_ext line sid cwd name pid perm
   local -a f
   rows_ext=$(print -r -- "$rows" | while IFS= read -r line; do
-    f=("${(@ps:\t:)line}")
+    eval 'f=("${(@ps:\t:)line}")'
     sid="${f[1]:-}"; cwd="${f[2]:-}"; name="${f[3]:-}"; pid="${f[4]:-}"
     [[ -z "$sid" ]] && continue
     printf '%s\t%s\t%s\t%s\t%s\n' "$sid" "$cwd" "$name" "$pid" "$(detect_perm_flags "$pid")"
@@ -565,7 +748,7 @@ cmd_save() {
   n=$(print -r -- "$rows_ext" | wc -l | tr -d ' ')
   ok "$n 件の会話を保存しました → $MANIFEST"
   print -r -- "$rows_ext" | while IFS= read -r line; do
-    f=("${(@ps:\t:)line}")
+    eval 'f=("${(@ps:\t:)line}")'
     sid="${f[1]:-}"; cwd="${f[2]:-}"; name="${f[3]:-}"; perm="${f[5]:-}"
     [[ -z "$sid" ]] && continue
     if [[ -n "$perm" ]]; then
@@ -581,12 +764,14 @@ cmd_save() {
 }
 
 cmd_restore() {
-  local fork=1 dry=0 inherit_perms=1 recap=0 inherit_bypass=0
+  local fork=1 dry=0 inherit_perms=1 force=0 rename=1 recap=0 inherit_bypass=0
   while (( $# )); do
     case "$1" in
       --fork)    fork=1 ;;
       --no-fork) fork=0 ;;
       --dry-run) dry=1 ;;
+      --force)   force=1 ;;
+      --no-rename) rename=0 ;;
       --no-inherit-perms) inherit_perms=0 ;;
       --inherit-bypass)   inherit_bypass=1 ;;
       --recap)   recap=1 ;;
@@ -616,9 +801,19 @@ cmd_restore() {
     *) warn "プラン '$plan' で Remote Control が使えるかは不明です（対象: Pro/Max/Team/Enterprise）" ;;
   esac
 
-  # いま別プロセスで開かれている会話（同じ transcript への多重書き込みを防ぐ）
+  # いま別プロセスで開かれている・すでに復帰済みの会話（同じ会話を二重に立ち上げないため）
   local open_ids
-  open_ids=$(scan_sessions open | cut -f1)
+  open_ids=$(running_session_ids)
+
+  # 復帰セッションに名前を付けられるか（claude のバージョンによっては -n が無い）
+  local name_ok=0
+  if (( rename )); then
+    if claude_supports_name; then
+      name_ok=1
+    else
+      info "この claude は -n（セッション名）に未対応のため、名前を付けずに起動します"
+    fi
+  fi
 
   # 注意: zsh ではループ内で `local` を再宣言すると変数の中身が出力されるため、
   # ループで使う変数はここでまとめて宣言する
@@ -627,7 +822,7 @@ cmd_restore() {
   # (z) でシェルと同じ規則に分割し、(Q) で引数を囲むクォートを外す
   # （"--append-system-prompt 'foo bar'" のようにスペースを含む引数も 1 個として渡せる）
   local -a claude_extra
-  claude_extra=(${(Q)${(z)${CLAUDE_RC_CLAUDE_ARGS:-}}})
+  eval 'claude_extra=(${(Q)${(z)${CLAUDE_RC_CLAUDE_ARGS:-}}})'
   (( ${#claude_extra} )) && info "claude 追加オプション: ${claude_extra[*]}"
 
   # 環境変数側で権限モードを明示していたら、manifest から引き継いだ分は使わない（二重指定の回避）
@@ -656,7 +851,7 @@ cmd_restore() {
 
   local resumed=0 skipped=0 now
   now=$(date +%s)
-  local sid cwd name opid perm label transcript win cmd_str last_epoch age_days pane_id pane_pid line
+  local sid cwd name opid perm label transcript win cmd_str last_epoch age_days pane_info pane_id pane_pid line
   local -a claude_cmd perm_args v_entries f
   # 同じ会話を 2 回起動すると 1 本の会話ログに両方が書き込まれるため、実行内でも重複を弾く
   # （古いバージョンが書いた manifest や手で編集した manifest に重複が残っていることがある）
@@ -665,7 +860,7 @@ cmd_restore() {
   while IFS= read -r line; do
     [[ -z "$line" || "$line" == \#* ]] && continue
     # IFS=$'\t' read は連続タブを畳んで列をずらすため使わない（無名セッション対策）
-    f=("${(@ps:\t:)line}")
+    eval 'f=("${(@ps:\t:)line}")'
     sid="${f[1]:-}"; cwd="${f[2]:-}"; name="${f[3]:-}"; opid="${f[4]:-}"; perm="${f[5]:-}"
     [[ -z "$sid" ]] && continue
     label="${name:-$sid}"
@@ -709,13 +904,20 @@ cmd_restore() {
     fi
     (( age_days >= 3 )) && info "$label: 最終チャットは ${age_days} 日前です（そのまま復帰します）"
 
+    # 既に動いている会話は既定で触らない（restore の複数回実行で同じ会話が二重に増えるため）
+    if (( ! force )) && print -r -- "$open_ids" | grep -Fqx -- "$sid"; then
+      info "skip (already running): $label"
+      (( skipped++ )) || true
+      continue
+    fi
+
     # manifest に記録された権限モード（save 時の元プロセスの起動引数）を引き継ぐ。
     # ただし bypass 系は既定で引き継がない: 検出は ps の起動引数を空白分割して行うため、
     # --append-system-prompt の値に同じ語が入っていると誤検出し得る。誤って別アカウントの
     # リモート操作可能なセッションに bypass が付くのは影響が大きいので opt-in にする
     perm_args=()
     if [[ -n "$perm" ]] && (( inherit_perms && ! perm_override )); then
-      perm_args=(${(z)perm})
+      eval 'perm_args=(${(z)perm})'
       if (( ! inherit_bypass )) && [[ "$perm" == *--dangerously-skip-permissions* || "$perm" == *bypassPermissions* ]]; then
         perm_args=(${perm_args:#--dangerously-skip-permissions})
         perm_args=(${perm_args:#--allow-dangerously-skip-permissions})
@@ -738,12 +940,13 @@ cmd_restore() {
     fi
 
     claude_cmd=(claude --resume "$sid" "${perm_args[@]}" "${claude_extra[@]}")
+    (( name_ok )) && claude_cmd+=(-n "$(restored_session_name "$label")")
     if print -r -- "$open_ids" | grep -Fqx -- "$sid"; then
       if (( fork )); then
         claude_cmd+=(--fork-session)
         info "$label: 元のプロセスが開いたままのため --fork-session で複製として復帰します"
       else
-        err "$label: この会話は別プロセスで開いたままです → skip（--no-fork 指定のため。複製復帰でよければ --no-fork を外して実行）"
+        err "$label: この会話は別プロセスで開いたままです → skip（--force --no-fork 指定のため。複製復帰でよければ --no-fork を外して実行）"
         (( skipped++ )) || true
         continue
       fi
@@ -759,11 +962,11 @@ cmd_restore() {
     fi
 
     win="${label//[^A-Za-z0-9_.-]/-}"
-    win="${win[1,30]}"
+    eval 'win="${win[1,30]}"'
 
     # tmux はコマンドをシェル文字列として受け取り sh -c で実行するため、
     # 各引数を個別にクォートしておく（スペースを含む CLAUDE_RC_CLAUDE_ARGS が分裂するのを防ぐ）
-    cmd_str="${(j: :)${(q-)claude_cmd[@]}}"
+    eval 'cmd_str="${(j: :)${(q-)claude_cmd[@]}}"'
 
     if (( dry )); then
       ok "[dry-run] $label: tmux '$TMUX_SESSION' で実行 → $cmd_str @ $cwd"
@@ -774,39 +977,12 @@ cmd_restore() {
     # 同時起動を避けて起動間隔を空ける（credential の同時発行・同時失効を緩和するため）
     (( ${#v_entries} > 0 && STAGGER_SECS > 0 )) && sleep "$STAGGER_SECS"
 
-    # claude 起動前に remain-on-exit を設定できるよう、まず保持コマンドで pane を作り、
-    # オプション設定後に respawn-pane で本来のコマンドへ差し替える。
-    # 起動後に設定すると、claude が即異常終了した場合に pane ごと消えて
-    # 原因確認できないレースがあるため
-    if ! tmux has-session -t "=$TMUX_SESSION" 2>/dev/null; then
-      pane_id=$(tmux new-session -d -P -F '#{pane_id}' -s "$TMUX_SESSION" -c "$cwd" -n "$win" 'sleep 600' </dev/null) || pane_id=""
-    else
-      pane_id=$(tmux new-window -t "$TMUX_SESSION" -P -F '#{pane_id}' -c "$cwd" -n "$win" 'sleep 600' </dev/null) || pane_id=""
-    fi
-    if [[ -z "$pane_id" ]]; then
-      err "$label: tmux のウィンドウ作成に失敗しました → skip"
+    if ! pane_info=$(launch_pane "$label" "$win" "$cwd" "$cmd_str" "$sid"); then
       (( skipped++ )) || true
       continue
     fi
-    # claude が異常終了した場合だけ pane を残す（原因確認用）。
-    # セッションターゲットへの set-option はカレントウィンドウにしか効かないため
-    # pane 単位で設定する。未対応の tmux では無視
-    tmux set-option -p -t "$pane_id" remain-on-exit failed 2>/dev/null || true
-    # このツールが起動した pane であることと、どの会話かを pane に記録する。
-    # restore の再実行で二重起動しないため／reconnect が無関係な pane にキーを送らないため
-    tmux set-option -p -t "$pane_id" '@rc_sid' "$sid" 2>/dev/null || true
-    if ! tmux respawn-pane -k -t "$pane_id" "$cmd_str" 2>/dev/null; then
-      err "$label: claude の起動に失敗しました → skip"
-      tmux kill-pane -t "$pane_id" 2>/dev/null || true
-      (( skipped++ )) || true
-      continue
-    fi
-    pane_pid=$(tmux display-message -p -t "$pane_id" '#{pane_pid}' 2>/dev/null) || pane_pid=""
-    if [[ -z "$pane_pid" ]]; then
-      err "$label: 起動直後に pane が消えました → skip"
-      (( skipped++ )) || true
-      continue
-    fi
+    pane_id="${pane_info%%$'\t'*}"
+    pane_pid="${pane_info#*$'\t'}"
     v_entries+=("${pane_pid}"$'\t'"$label")
     ok "$label: 起動しました（tmux window: $win）"
     (( resumed++ )) || true
@@ -860,6 +1036,143 @@ cmd_restore() {
     info "  復帰した各セッションで「これまでの経緯を要約して」と 1 通送ってください"
   fi
   return $rc
+}
+
+# manifest 無しで復旧するモード（save する前にクラッシュ／強制終了した場合の受け皿）
+#   ~/.claude/projects/ の会話ログから「直近に更新された & いま動いていない」ものを拾って resume する
+cmd_recover() {
+  local dry=0 auto_confirm=0 rename=1 hours="$RECOVER_HOURS"
+  while (( $# )); do
+    case "$1" in
+      --within)
+        shift
+        if [[ ! "${1:-}" =~ ^[0-9]+$ ]]; then
+          err "--within には時間（数値）を指定してください"
+          return 1
+        fi
+        hours="$1" ;;
+      --dry-run)      dry=1 ;;
+      --auto-confirm) auto_confirm=1 ;;
+      --no-rename)    rename=0 ;;
+      *) err "不明なオプション: $1"; return 1 ;;
+    esac
+    shift
+  done
+  need python3
+  need claude
+  (( dry )) || need_tmux || return 1
+
+  local rows
+  local -a running_ids
+  eval 'running_ids=(${(f)"$(running_session_ids)"})'
+  rows=$(scan_recoverable "$hours" "${running_ids[@]}")
+  if [[ -z "$rows" ]]; then
+    info "直近 ${hours} 時間以内に更新された、いま動いていない会話はありません"
+    return 0
+  fi
+
+  # 復帰セッションに名前を付けられるか（claude のバージョンによっては -n が無い）
+  local name_ok=0
+  if (( rename )); then
+    if claude_supports_name; then
+      name_ok=1
+    else
+      info "この claude は -n（セッション名）に未対応のため、名前を付けずに起動します"
+    fi
+  fi
+
+  print -- "復旧候補（直近 ${hours} 時間・実行中のものを除く）:"
+  # 注意: zsh ではループ内で `local` を再宣言すると変数の中身が出力されるため、
+  # ループで使う変数はここでまとめて宣言する
+  local when sid cwd proj title label win cmd_str pane_info pane_id pane_pid last_proj=""
+  local recovered=0 skipped=0
+  local -a claude_cmd v_entries d_entries
+  v_entries=()
+  d_entries=()
+  while IFS=$'\t' read -r when sid cwd proj title; do
+    [[ -z "$sid" ]] && continue
+    label="${title:-$sid}"
+
+    if [[ "$proj" != "$last_proj" ]]; then
+      print -- "[${cwd:-$proj}]"
+      last_proj="$proj"
+    fi
+
+    # cwd は会話ログの先頭から拾う。取れない／消えている場合は起動先が決まらないので skip
+    if [[ -z "$cwd" || ! -d "$cwd" ]]; then
+      err "$label: 作業ディレクトリを特定できません → skip (${cwd:-不明})"
+      (( skipped++ )) || true
+      continue
+    fi
+
+    claude_cmd=(claude --resume "$sid")
+    (( name_ok )) && claude_cmd+=(-n "$(restored_session_name "$label")")
+
+    win="${label//[^A-Za-z0-9_.-]/-}"
+    eval 'win="${win[1,30]}"'
+
+    # tmux はコマンドをシェル文字列として受け取り sh -c で実行するため、各引数を個別にクォートする
+    eval 'cmd_str="${(j: :)${(q-)claude_cmd[@]}}"'
+
+    if (( dry )); then
+      ok "[dry-run] $when  $sid  ${title:-(タイトル不明)}"
+      info "  → $cmd_str"
+      (( recovered++ )) || true
+      continue
+    fi
+
+    # 同時起動を避けて起動間隔を空ける（credential の同時発行・同時失効を緩和するため）
+    (( ${#v_entries} > 0 && STAGGER_SECS > 0 )) && sleep "$STAGGER_SECS"
+
+    if ! pane_info=$(launch_pane "$label" "$win" "$cwd" "$cmd_str" "$sid"); then
+      (( skipped++ )) || true
+      continue
+    fi
+    pane_id="${pane_info%%$'\t'*}"
+    pane_pid="${pane_info#*$'\t'}"
+    v_entries+=("${pane_pid}"$'\t'"$label")
+    d_entries+=("${pane_id}"$'\t'"$label")
+    ok "$label: 起動しました（tmux window: $win）"
+    (( recovered++ )) || true
+  done <<< "$rows"
+
+  print
+  if (( dry )); then
+    ok "候補 $recovered 件 / skip $skipped 件（--dry-run のため起動していません）"
+    return 0
+  fi
+  ok "完了: 起動 $recovered 件 / skip $skipped 件"
+  (( recovered > 0 )) || return 0
+
+  # restore と違い trust ダイアログや「Resume from summary」で止まることがある
+  # （manifest 経由でないぶん、最後に開いた状態が読めないため）
+  sleep "$CONFIRM_WAIT"
+  handle_confirm_dialogs "$auto_confirm" "${d_entries[@]}"
+  if (( CONFIRM_PENDING > 0 )); then
+    print
+    warn "${CONFIRM_PENDING} 個のセッションが確認ダイアログ待ちです。--auto-confirm で自動応答できます"
+    info "（または tmux attach -t $TMUX_SESSION でウィンドウを開き、手動で Enter）"
+    return 1
+  fi
+
+  if (( VERIFY_TIMEOUT > 0 )); then
+    print
+    print -- "── RC 登録の確認（最大 ${VERIFY_TIMEOUT} 秒待機） ──"
+    if wait_rc_registration "$VERIFY_TIMEOUT" "${v_entries[@]}"; then
+      print
+      ok "すべての会話の RC 登録を確認しました"
+      info "claude.ai/code または モバイルアプリに新しいセッションとして表示されます"
+    else
+      print
+      warn "RC 未登録の会話があります。以下で再接続を試してください:"
+      info "claude-rc-reattach reconnect"
+      return 1
+    fi
+  else
+    print
+    info "確認方法:"
+    info "  tmux attach -t $TMUX_SESSION     # 各ウィンドウのフッターに /rc active が出ていれば成功"
+  fi
 }
 
 # restore 後に RC が未登録・切断状態になったセッションへ /remote-control を送って再接続する
@@ -963,7 +1276,7 @@ cmd_reconnect() {
     info "各ウィンドウのフッターに /rc active が出ているか確認してください（tmux attach -t $TMUX_SESSION）"
   fi
   # 再接続で作られる RC セッションにも、切り替え前の履歴は送られない
-  (( recap )) && { send_recap "${target_entries[@]}" || true }
+  (( recap )) && { send_recap "${target_entries[@]}" || true; }
   (( n_missing + n_dead > 0 )) && rc=1
   return $rc
 }
@@ -975,7 +1288,7 @@ cmd_switch() {
   while (( $# )); do
     case "$1" in
       --dry-run) dry=1; pass_opts+=("$1") ;;
-      --fork|--no-fork|--no-inherit-perms|--inherit-bypass|--recap) pass_opts+=("$1") ;;
+      --fork|--no-fork|--force|--no-rename|--no-inherit-perms|--inherit-bypass|--recap) pass_opts+=("$1") ;;
       *) err "不明なオプション: $1"; return 1 ;;
     esac
     shift
@@ -1033,7 +1346,7 @@ cmd_switch() {
     fi
     # 閉じ忘れの検知: manifest に記録した会話がまだ開いたままなら列挙して確認する
     open_left=$(scan_sessions open | while IFS= read -r line; do
-      f=("${(@ps:\t:)line}")
+      eval 'f=("${(@ps:\t:)line}")'
       sid="${f[1]:-}"; cwd="${f[2]:-}"; name="${f[3]:-}"; pid="${f[4]:-}"
       [[ -z "$sid" ]] && continue
       print -r -- "$manifest_sids" | grep -Fqx -- "$sid" && print -- "  • ${name:-(無名)}  [$cwd]  pid=$pid"
@@ -1084,12 +1397,16 @@ COMMANDS:
   save               RC 接続中の会話を manifest に保存（切り替え「前」に実行）
   restore [options]  manifest の会話を tmux 内で resume して RC 再登録（切り替え「後」に実行）
   switch  [options]  save → logout → login → restore を一括実行
+  recover [options]  manifest 無しで、直近に更新された会話ログから復旧（クラッシュ後の受け皿）
   reconnect [--recap] tmux 内の RC 未登録セッションに /remote-control を送信して再接続
   help               このヘルプを表示
 
 RESTORE/SWITCH OPTIONS:
-  --no-fork            元プロセスが開いたままの会話を複製せず skip する
+  --force              すでに動いている会話も復帰させる
+                       （既定: 動いている会話は "skip (already running)" として触らない）
+  --no-fork            --force 時、元プロセスが開いたままの会話を複製せず skip する
                        （既定: --fork-session で複製として復帰。元の会話は変更されない）
+  --no-rename          復帰セッションに名前（<元の名前>-restored-MMDD）を付けない
   --no-inherit-perms   save 時に検出した権限モードを引き継がない（既定: 引き継ぐ）
   --inherit-bypass     bypass 系の権限モードも引き継ぐ
                        （--dangerously-skip-permissions / --permission-mode bypassPermissions。
@@ -1104,6 +1421,12 @@ EXIT STATUS (restore / switch):
   0  すべての会話を復帰し、RC 登録も確認できた
   1  1 件も復帰できなかった、または RC 登録を確認できなかった
   2  一部の会話を skip した（部分成功）
+
+RECOVER OPTIONS:
+  --within <hours>     この時間内に更新された会話ログを対象にする（既定: $RECOVER_HOURS）
+  --auto-confirm       起動後の確認ダイアログ（trust / Resume from summary）に Enter を自動送信
+  --no-rename          復帰セッションに名前を付けない
+  --dry-run            候補一覧だけ表示して起動しない
 
 ENVIRONMENT:
   CLAUDE_RC_MANIFEST       manifest の保存先（既定: $STATE_DIR/manifest.tsv）
@@ -1120,6 +1443,8 @@ ENVIRONMENT:
   CLAUDE_RC_RECAP_PROMPT   --recap で送るプロンプト（必ず 1 行で書くこと）
                            （既定: これまでの会話の経緯と、いま取り組んでいることを
                              5 行以内で要約してください。）
+  CLAUDE_RC_RECOVER_HOURS  recover の既定の対象時間（既定: 6。--within で上書き）
+  CLAUDE_RC_CONFIRM_WAIT   recover で確認ダイアログを見に行くまでの待ち秒数（既定: 10）
 EOF
 }
 
@@ -1128,6 +1453,7 @@ case "${1:-help}" in
   save)      shift; cmd_save "$@" ;;
   restore)   shift; cmd_restore "$@" ;;
   switch)    shift; cmd_switch "$@" ;;
+  recover)   shift; cmd_recover "$@" ;;
   reconnect) shift; cmd_reconnect "$@" ;;
   -h|--help|help) usage ;;
   -v|--version)   print -- "$VERSION" ;;
