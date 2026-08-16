@@ -55,8 +55,14 @@ git clone https://github.com/igarashi-hobby/claude-rc-reattach.git
 cd claude-rc-reattach
 chmod +x bin/claude-rc-reattach
 
+# ここから先はリポジトリのルート（cd した直後のディレクトリ）で実行すること
 # PATH の通った場所にシンボリックリンクを作成
-ln -s "$(pwd)/bin/claude-rc-reattach" ~/.local/bin/claude-rc-reattach
+mkdir -p ~/.local/bin
+ln -sf "$PWD/bin/claude-rc-reattach" ~/.local/bin/claude-rc-reattach
+
+# リンク先が実在するか確認（No such file と出たら別ディレクトリで実行している）
+ls -L ~/.local/bin/claude-rc-reattach
+
 # ~/.local/bin が PATH にない場合は .zshrc に以下を追加:
 #   export PATH="$HOME/.local/bin:$PATH"
 ```
