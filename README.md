@@ -2,7 +2,11 @@
 
 Claude Code のアカウントを切り替えると、Remote Control（RC）接続中だった会話は新しいアカウントから操作できなくなります。
 このツールは、その会話を**新しいアカウントの RC セッションとして復帰**させます。
-会話の中身はそのまま引き継がれます。
+ターミナル内の会話（文脈）はそのまま引き継がれます。
+
+> **対象は Claude Code CLI のセッションだけです。**
+> Claude Desktop アプリは CLI とは別に認証を持つため、このツールでは切り替わりません（アプリ側で個別にサインインし直してください）。
+> また、**復帰後のスマホ / claude.ai/code には切り替え前のやりとりは表示されません**（Claude Code 側の仕様。[詳細](#リモート側に切り替え前の履歴は表示されない)）。
 
 ## 使い方は 3 ステップ
 
@@ -42,7 +46,7 @@ tmux attach -t rc-restore
 
 | 要件 | 補足 |
 |---|---|
-| macOS | Claude Code v2.1.232 で検証（Linux は動く見込みだが未検証） |
+| macOS | Claude Code v2.1.233 で検証（Linux は動く見込みだが未検証） |
 | Claude Code v2.1.200 以降 | |
 | tmux | `brew install tmux`。restore / switch / reconnect で必要（無い場合は実行時にインストール方法を案内して停止します。list / save は tmux 不要） |
 | python3 | Xcode Command Line Tools に付属 |
@@ -73,10 +77,10 @@ ls -L ~/.local/bin/claude-rc-reattach
 claude-rc-reattach list   # RC 接続中の会話が一覧表示されれば OK
 ```
 
-### 推奨設定
+### 推奨設定（任意）
 
-`~/.claude/settings.json` に以下を追加してください。
-resume したセッションが自動的に RC 登録されるようになります（このツールの前提設定です）:
+restore は `claude --resume <sessionId> --remote-control <会話名>` の形で起動するため、**復帰させるだけならこの設定は不要**です。
+普段のセッションも自動で RC 接続したい場合は、`~/.claude/settings.json` に以下を追加してください:
 
 ```json
 {
@@ -95,7 +99,7 @@ resume したセッションが自動的に RC 登録されるようになりま
 | `save` | 切り替え**前** | RC 接続中の会話を manifest ファイルに記録 |
 | `restore` | 切り替え**後**（ログイン済み） | manifest の各会話を tmux 内で resume し、RC 再登録と登録確認まで行う |
 | `switch` | — | save → logout → login → restore を対話形式で一括実行 |
-| `reconnect` | restore 後いつでも | tmux 内の RC 未登録セッションに `/remote-control` を送信して再接続 |
+| `reconnect` | restore 後いつでも | tmux 内の RC 未登録セッションに `/remote-control` を送信して再接続（`--recap` 可） |
 
 ### switch（一括実行）
 
@@ -119,7 +123,17 @@ claude-rc-reattach switch
 |---|---|
 | `--no-fork` | 元プロセスが開いたままの会話を複製せず skip する |
 | `--no-inherit-perms` | save 時に検出した権限モードを引き継がない |
-| `--dry-run` | 実際には起動せず、何が行われるかだけ表示 |
+| `--inherit-bypass` | bypass 系の権限モードも引き継ぐ（既定では引き継がない。後述） |
+| `--recap` | RC 登録できた会話に「経緯を要約して」を 1 通送る（リモート側に文脈を残すため。`reconnect` でも使える） |
+| `--dry-run` | 実際には起動せず、何が行われるかだけ表示（`switch` では manifest の上書きも logout / login も行いません） |
+
+**終了コード（restore / switch）**:
+
+| コード | 意味 |
+|---|---|
+| `0` | すべての会話を復帰し、RC 登録も確認できた |
+| `1` | 1 件も復帰できなかった、または RC 登録を確認できなかった |
+| `2` | 一部の会話を skip した（部分成功） |
 
 **元プロセスが開いたままの会話の扱い（既定 = 複製復帰）**:
 同じ会話を 2 つのプロセスで同時に開くと会話ログへの多重書き込みが起きるため、開いたままの会話は既定で `--fork-session` を付けて「複製」として復帰します。
@@ -127,9 +141,23 @@ claude-rc-reattach switch
 ただし複製後は 2 つの会話が別々に進むため、**同一の会話として復帰させたい場合は、restore の前に元のターミナルを閉じてください**。
 複製も作りたくない場合は `--no-fork` を付けると該当の会話を skip します。
 
-**古い会話は復帰対象外（既定 = 最終チャットから 3 日以内のみ）**:
-会話ログの最終エントリが 3 日より前の会話は、放置されたものとみなして restore で skip します。
-上限日数は環境変数 `CLAUDE_RC_MAX_AGE_DAYS` で変更でき、`0` にするとこのチェック自体を無効化できます。
+**RC は起動時に明示します**:
+restore は `claude --resume <sessionId> --remote-control <会話名>` で起動します。
+`remoteControlAtStartup` の設定に依存しないため、設定が無い環境でもそのまま RC 接続されます。
+会話名は claude.ai/code のセッション名として渡されるので、一覧で見分けが付きます。
+`CLAUDE_RC_CLAUDE_ARGS` で `--remote-control` を自分で指定した場合は、そちらが使われます（二重指定にはなりません）。
+
+**古い会話も既定では捨てません**:
+save が記録するのは「実行中かつ RC 接続中」の会話だけなので、最終チャットが古くても放置された会話とは限りません。
+そのため既定では日数による skip をせず、3 日以上前の会話には次のように一言添えるだけにしています:
+
+```
+  my-project: 最終チャットは 12 日前です（そのまま復帰します）
+```
+
+古い会話を復帰対象から外したい場合は、環境変数 `CLAUDE_RC_MAX_AGE_DAYS` に 1 以上を指定してください（例: `CLAUDE_RC_MAX_AGE_DAYS=7`）。
+
+指定した場合、会話ログの最終エントリがその日数より前の会話は restore で skip します（`0` に戻すと skip しません）。
 
 ### RC 登録の自動確認と reconnect
 
@@ -146,11 +174,51 @@ claude-rc-reattach reconnect
 # 未登録のものにだけ /remote-control を送信 → 登録を再確認します
 ```
 
-reconnect の対象は tmux セッション（既定: `rc-restore`）内の pane のみです。
-通常のターミナルで開いているセッションにはキー送信ができないため、そちらは手動で `/remote-control` を実行してください。
+reconnect の対象は、tmux セッション（既定: `rc-restore`）内で **restore が起動した pane だけ**です（pane に印を付けて識別しています）。
+同じ tmux セッションに手で作ったウィンドウや、通常のターミナルで開いているセッションにはキーを送りません。
+そちらは手動で `/remote-control` を実行してください。
 また、対象ウィンドウの入力欄に入力中の文字が残っていると送信内容が混ざるため、入力欄は空にしておいてください。
 
+**restore は繰り返し実行しても複製を作りません**。
+既に復帰済みで tmux ウィンドウが生きている会話は skip します。
+RC だけが切れている場合は `reconnect` を使ってください。
+
 restore はセッションの同時起動による credential の同時発行・同時失効を緩和するため、各ウィンドウの起動間隔を既定で 3 秒空けます（`CLAUDE_RC_STAGGER_SECS` で変更、`0` で無効化）。
+
+### リモート側に切り替え前の履歴は表示されない
+
+**ターミナル内の会話はそのまま継続しますが、復帰後のスマホ / claude.ai/code には切り替え前のやりとりは表示されません。**
+これは Claude Code 側の意図的な保護で、このツールでは変えられません。
+
+仕組みはこうです。
+Claude Code は会話ログの中に「この会話はどの RC セッション・どのアカウントに紐づいていたか」を `bridge-session` レコードとして記録しています。
+アカウントを切り替えたあとに resume すると、記録された所有アカウントと現在のログインが食い違うため、**新しい RC セッションは作られるものの、過去のメッセージはサーバーへ送られません**。
+Claude Code 内部ではこれを「クロスアカウント抑止（cross-account suppression）」と呼んでおり、アカウント A の時代に書かれた内容をアカウント B のサーバー側ストレージへ持ち込まないための仕組みです。
+[公式ドキュメント](https://code.claude.com/docs/en/remote-control#resume-outcomes)にも次のように明記されています:
+
+> **The record names a different account**: Claude Code starts a new session without the conversation's earlier messages and without showing a message, whether or not the recorded session still exists.
+
+さらに、この抑止が一度起きると会話ログに永続レコード（`{"type":"history-suppression", "cause":"chokepoint_veto", ...}`）が追記され、`--fork-session` の複製先にも引き継がれます。
+**つまり、一度切り替え後に開いた会話は、以後どのアカウントで開いてもリモートに履歴が出ません。**
+`list` はこの状態を検出して `⚑ リモート履歴は抑止済み` と表示します。
+
+**回避策としての会話ログの書き換えは行いません。**
+技術的には該当レコードを削れば抑止を外せますが、それは「組織 A の会話内容を組織 B のサーバーへ黙って送る」という、まさにこの保護が防いでいる事象を起こします。
+
+#### 代わりに: `--recap` で要約を送る
+
+抑止されるのは**過去ログの一括アップロードだけ**で、RC 確立後の新しいやりとりは通常どおり双方向に同期されます。
+そこで復帰直後に要約を 1 通送っておけば、リモート側にも文脈が残ります:
+
+```bash
+claude-rc-reattach restore --recap
+# RC 登録を確認できた会話にだけ「これまでの会話の経緯と、いま取り組んでいることを
+# 5 行以内で要約してください。」を送信します（RC 未登録の会話には送りません）
+```
+
+`switch --recap` / `reconnect --recap` でも同じように使えます。
+プロンプトは環境変数 `CLAUDE_RC_RECAP_PROMPT` で変更できます（送信後すぐ Enter を打つため、必ず 1 行で書いてください）。
+`reconnect` と同じくキー送信で行うため、**対象ウィンドウの入力欄は空にしておいてください**。
 
 ### 権限モードの引き継ぎ（--dangerously-skip-permissions 等）
 
@@ -160,20 +228,29 @@ restore はセッションの同時起動による credential の同時発行・
 ```
 $ claude-rc-reattach save
 ✔ 2 件の会話を保存しました → ...
-  • my-project  [/path/to/project]  権限モード: --dangerously-skip-permissions
+  • my-project  [/path/to/project]  権限モード: --permission-mode plan
 
 $ claude-rc-reattach restore
-  my-project: 権限モードを引き継ぎます（--dangerously-skip-permissions）
+  my-project: 権限モードを引き継ぎます（--permission-mode plan）
 ```
 
 引き継ぎ対象は `--dangerously-skip-permissions` / `--allow-dangerously-skip-permissions` / `--permission-mode` / `--permission-prompt-tool` です。
 `--model` などそれ以外のオプションは引き継ぎません。
+`--permission-mode` の値は既知のモード名（`default` / `acceptEdits` / `auto` / `dontAsk` / `bypassPermissions` / `plan`）のときだけ拾います。
+
+**bypass 系だけは既定で引き継ぎません**:
+検出は `ps` の起動引数を空白で分割して行うため、`--append-system-prompt` の値に同じ語が入っていると誤検出し得ます（引用符の情報は `ps` では失われます）。
+誤って別アカウントのリモート操作可能なセッションに bypass が付くのは影響が大きいため、`--dangerously-skip-permissions` / `--allow-dangerously-skip-permissions` / `--permission-mode bypassPermissions` はオプトインにしています:
+
+```bash
+claude-rc-reattach restore --inherit-bypass   # bypass も引き継ぐ
+```
 
 **有効にした方法によって挙動が変わります**:
 
 | bypass を有効にした方法 | 復帰後 |
 |---|---|
-| `claude --dangerously-skip-permissions` で起動 | **自動で引き継がれる**（save 時に検出） |
+| `claude --dangerously-skip-permissions` で起動 | save 時に検出されるが、**引き継ぐには `--inherit-bypass` が必要** |
 | `~/.claude/settings.json` の `defaultMode` | 元から適用される（このツールは何もしない） |
 | セッション中に `/permissions` で変更 | 引き継がれない（どこにも記録されないため検出不可） |
 
@@ -209,9 +286,10 @@ CLAUDE_RC_CLAUDE_ARGS="--dangerously-skip-permissions --append-system-prompt '�
 | `CLAUDE_RC_MANIFEST` | `~/.local/state/claude-rc-reattach/manifest.tsv` | manifest の保存先 |
 | `CLAUDE_RC_TMUX_SESSION` | `rc-restore` | 復帰先の tmux セッション名 |
 | `CLAUDE_RC_CLAUDE_ARGS` | （なし） | restore 時に `claude` コマンドへ追加するオプション（スペース区切りで複数可。値にスペースを含む場合は `'...'` か `"..."` で囲む） |
-| `CLAUDE_RC_MAX_AGE_DAYS` | `3` | 最終チャットからこの日数を超えた会話は restore で skip する（`0` で無効化） |
+| `CLAUDE_RC_MAX_AGE_DAYS` | `0` | 最終チャットからこの日数を超えた会話を restore で skip する（`0` = skip しない。1 以上で有効） |
 | `CLAUDE_RC_VERIFY_TIMEOUT` | `60` | restore / reconnect 後に RC 登録を確認する最大秒数（`0` で確認しない） |
 | `CLAUDE_RC_STAGGER_SECS` | `3` | restore で各セッションを起動する間隔の秒数（credential の同時発行・同時失効の緩和用。`0` で無効化） |
+| `CLAUDE_RC_RECAP_PROMPT` | `これまでの会話の経緯と、いま取り組んでいることを 5 行以内で要約してください。` | `--recap` で送るプロンプト（必ず 1 行で書くこと） |
 
 ## 仕組み
 
@@ -222,10 +300,12 @@ RC セッションは**サーバー側でアカウントに紐づいている**�
 ```
 切り替え前                          切り替え後
 ─────────                          ─────────
-save: RC接続中の会話を記録    →    restore: 各会話を claude --resume で
-（~/.claude/sessions/ を走査）      tmux 内に立ち上げ直す
+save: RC接続中の会話を記録    →    restore: 各会話を claude --resume
+（~/.claude/sessions/ を走査）      --remote-control で tmux 内に立ち上げ直す
                                     → 新アカウント配下の新しい RC セッション
-                                      として再登録される（会話の中身は継続）
+                                      として再登録される
+                                      （ターミナル内の会話は継続。ただしリモート側には
+                                        切り替え前の履歴は表示されない）
 ```
 
 RC 接続中かどうかは、Claude Code が実行中セッションごとに書き出す `~/.claude/sessions/<PID>.json` の `bridgeSessionId` フィールドの有無で判定しています。
@@ -235,8 +315,15 @@ RC 接続中かどうかは、Claude Code が実行中セッションごとに�
 ## 制約・知っておくべきこと
 
 - **RC セッション ID は新規になります。**
-  claude.ai/code 上では「新しいセッション」として表示されます（会話の中身は継続）。
+  claude.ai/code 上では「新しいセッション」として表示されます（ターミナル内の会話は継続）。
   旧アカウント側のセッション一覧には非アクティブなエントリが残りますが、これは仕様上消せません
+- **リモート側には切り替え前のやりとりが表示されません。**
+  Claude Code のクロスアカウント抑止によるもので、このツールでは変えられません。
+  復帰後の新しいやりとりは通常どおり同期されるため、`--recap` で要約を 1 通送っておくと文脈が残ります（[詳細](#リモート側に切り替え前の履歴は表示されない)）
+- **Claude Desktop アプリのアカウントは切り替わりません。**
+  Desktop は CLI とは別に認証を持つ（独自の OAuth トークンと同梱の Claude Code を使う）ため、`claude auth logout` / `login` の影響を受けません。
+  Desktop も使っている場合は、アプリ側でサインアウト → 新アカウントでサインインしてください。
+  Desktop の Code タブのセッション履歴も CLI とは別管理で、このツールの復帰対象にはなりません
 - **復帰後も RC が切断されることがあります。**
   RC は接続後も短命の credential を定期更新しており、更新失敗（トークン失効・並行セッションの refresh 競合など）で切断されることがあります。
   restore の確認が ✔ でも後から切断され得るため、切れていたら `reconnect` を実行してください
@@ -253,7 +340,7 @@ RC 接続中かどうかは、Claude Code が実行中セッションごとに�
 - **権限モードの検出は `ps` の起動引数から行うため、引用符の情報は失われます。**
   `--append-system-prompt "... --permission-mode plan ..."` のように他オプションの値の中に権限フラグと同じ語が含まれていると、誤って権限モードとして検出することがあります。
   その場合は `--no-inherit-perms` で引き継ぎを無効化してください
-- `~/.claude/sessions/<PID>.json` は非公開の内部仕様です（v2.1.232 で動作検証）。
+- `~/.claude/sessions/<PID>.json` は非公開の内部仕様です（v2.1.233 で動作検証）。
   Claude Code のアップデートで形式が変わる可能性があります。
   動かなくなったら `claude-rc-reattach list` の結果と `ls ~/.claude/sessions/` を見比べてください
 
@@ -265,10 +352,13 @@ RC 接続中かどうかは、Claude Code が実行中セッションごとに�
 | restore 後に `/rc active` が出ない | restore の RC 登録確認で ⚠ になった会話は `claude-rc-reattach reconnect` で再接続を試す。それでもだめなら `claude doctor` で RC の適格性チェックを確認。`ANTHROPIC_API_KEY` が環境にセットされていると RC が無効になるため `unset` する |
 | 復帰後しばらくして `Remote Control disconnected — Transport closed: worker credential expired or rejected (code 4094)` や `could not fetch fresh session credentials after code 401` が出る | RC の worker credential 更新に失敗して切断された状態。旧アカウントのまま開き続けたセッションでは logout によるトークン失効のため必ず発生する（そのセッションの RC は復旧不可。新アカウントで開き直す）。同一アカウントでも複数セッション並行時の OAuth refresh 競合で発生することがある Claude Code 側の既知問題（[#54443](https://github.com/anthropics/claude-code/issues/54443) / [#61912](https://github.com/anthropics/claude-code/issues/61912) / [#78309](https://github.com/anthropics/claude-code/issues/78309)）。tmux 内のセッションなら `claude-rc-reattach reconnect`、通常のターミナルなら該当セッションで `/remote-control` を実行して再接続する |
 | ウィンドウがすぐ落ちる | tmux 3.2 以降なら異常終了した pane が残るので、そこにエラーが表示されています。`tmux attach -t rc-restore` で確認 |
-| 「会話ログが見つかりません」で skip される | 該当プロジェクトの `~/.claude/projects/<エンコード名>/<sessionId>.jsonl` が存在するか確認 |
+| 「会話ログが見つかりません」で skip される | `~/.claude/projects/*/<sessionId>.jsonl` が存在するか確認（規則どおりの場所に無い場合は projects 配下を総当たりで探します） |
 | 「別プロセスで開いたままです」で skip される | `--no-fork` を付けた場合の動作です。外せば複製として復帰します（既定） |
-| 「最終チャットが N 日前」で skip される | 既定で最終チャットが 3 日より古い会話は復帰しません。`CLAUDE_RC_MAX_AGE_DAYS` で上限を変更するか、`CLAUDE_RC_MAX_AGE_DAYS=0` で無効化できます |
-| 復帰後に `--dangerously-skip-permissions` が外れている | save 時の manifest 5 列目に記録されているか確認（`save` の出力に「権限モード:」が出ていれば検出済み）。セッション中に `/permissions` で変更した場合は検出できないため、`CLAUDE_RC_CLAUDE_ARGS` で明示指定してください（上記「権限モードの引き継ぎ」参照） |
+| 「最終チャットが N 日前」で skip される | `CLAUDE_RC_MAX_AGE_DAYS` に 1 以上を指定した場合の動作です。既定（`0`）では古い会話も復帰します |
+| 復帰後に `--dangerously-skip-permissions` が外れている | bypass 系は既定で引き継ぎません。`--inherit-bypass` を付けるか、`CLAUDE_RC_CLAUDE_ARGS` で明示指定してください。セッション中に `/permissions` で変更した場合は検出できません（上記「権限モードの引き継ぎ」参照） |
+| スマホ / claude.ai/code に切り替え前のやりとりが出ない | 仕様です（Claude Code のクロスアカウント抑止）。`--recap` を付けて実行するか、復帰したセッションで要約を 1 通送ってください（上記「[リモート側に切り替え前の履歴は表示されない](#リモート側に切り替え前の履歴は表示されない)」参照） |
+| `list` に `⚑ リモート履歴は抑止済み` と出る | その会話は既にクロスアカウント抑止が確定しており、以後どのアカウントで開いてもリモートに履歴は出ません。`--recap` で文脈を補ってください |
+| Claude Desktop アプリが旧アカウントのまま | このツールは CLI の認証だけを切り替えます。Desktop はアプリ側でサインアウト → 新アカウントでサインインしてください |
 
 ## ライセンス
 
