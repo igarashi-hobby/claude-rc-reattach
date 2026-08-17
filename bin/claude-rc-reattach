@@ -1723,7 +1723,7 @@ cmd_recover() {
 
 # tmux の復元セッション内で、会話ログの最終更新が古い pane を閉じる
 cmd_prune() {
-  local idle=6 dry=0 yes=0
+  local idle=120 dry=0 yes=0
   while (( $# )); do
     case "$1" in
       --idle)
@@ -2220,7 +2220,7 @@ RECOVER OPTIONS:
   --dry-run            候補一覧だけ表示して起動しない
 
 PRUNE OPTIONS:
-  --idle <hours>        この時間より会話ログの最終更新が古い復元paneを対象にする（既定: 6）
+  --idle <hours>        この時間より会話ログの最終更新が古い復元paneを対象にする（既定: 120=5日）
   --dry-run            候補一覧だけ表示して終了処理はしない
   --yes                店じまい確認を省略する
 
