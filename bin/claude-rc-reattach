@@ -31,10 +31,10 @@ WAVE_SIZE="${CLAUDE_RC_WAVE_SIZE:-3}"
 CONFIRM_PENDING=0   # handle_confirm_dialogs の結果（ダイアログ待ちの pane 数）
 RESUME_MODE="as-is"
 CONFIRM_DIALOG_ENTRIES=()
-# --recap で送るプロンプト。復帰後の RC セッションには切り替え前の履歴が送られない
+# recap で送るプロンプト。復帰後の RC セッションには切り替え前の履歴が送られない
 # （Claude Code のクロスアカウント抑止）ため、要約を 1 通送って文脈をリモートに残す。
 # 送信後すぐ Enter を打つので、必ず 1 行で書くこと
-RECAP_PROMPT="${CLAUDE_RC_RECAP_PROMPT:-これまでの会話の経緯と、いま取り組んでいることを 5 行以内で要約してください。}"
+RECAP_PROMPT="${CLAUDE_RC_RECAP_PROMPT:-アカウント切替で画面上の履歴が空になっています。これまでの会話の経緯・決定事項・いま取り組んでいる作業を10行以内で要約して表示してください。}"
 
 err()  { print -u2 -- "✖ $*"; }
 warn() { print -- "⚠ $*"; }
@@ -454,7 +454,7 @@ for n in nums:
   print -r -- "$selected"
 }
 
-# RC 登録済みの pane に「要約して」を 1 通送る（--recap）
+# RC 登録済みの pane に「要約して」を 1 通送る
 #   アカウント切り替え後の RC セッションには切り替え前の履歴が送られない
 #   （Claude Code のクロスアカウント抑止。仕組みは README 参照）。
 #   一方、RC 確立後の新しいやりとりは通常どおり双方向に同期されるため、
@@ -483,7 +483,7 @@ send_recap() {
   done
 
   print
-  print -- "── 経緯の要約を送信（--recap） ──"
+  print -- "── 経緯の要約を送信 ──"
   print -r -- "$(pane_rc_status "${panes[@]}")" | while IFS=$'\t' read -r pid st sid; do
     [[ -n "${label_of[$pid]:-}" ]] || continue
     if [[ "$st" != connected || -z "${id_of[$pid]:-}" ]]; then
@@ -1014,7 +1014,7 @@ cmd_save() {
 }
 
 cmd_restore() {
-  local fork=1 dry=0 inherit_perms=1 force=0 rename=1 recap=0 inherit_bypass=0 yes=0 limit="$MAX_SESSIONS" pick=0 wave_size="$WAVE_SIZE"
+  local fork=1 dry=0 inherit_perms=1 force=0 rename=1 recap=1 inherit_bypass=0 yes=0 limit="$MAX_SESSIONS" pick=0 wave_size="$WAVE_SIZE"
   RESUME_MODE="as-is"
   while (( $# )); do
     case "$1" in
@@ -1027,6 +1027,7 @@ cmd_restore() {
       --no-inherit-perms) inherit_perms=0 ;;
       --inherit-bypass)   inherit_bypass=1 ;;
       --recap)   recap=1 ;;
+      --no-recap) recap=0 ;;
       --pick)    pick=1 ;;
       --limit)
         shift
@@ -1425,8 +1426,7 @@ cmd_restore() {
   if (( recap )); then
     send_recap "${v_entries[@]}" || true
   else
-    info "  経緯をリモートにも残したい場合は --recap を付けて実行するか、"
-    info "  復帰した各セッションで「これまでの経緯を要約して」と 1 通送ってください"
+    info "  --no-recap 指定のため、要約送信は行いません"
   fi
   report_limit_remainder "$remainder_rows"
   return $rc
@@ -1435,7 +1435,7 @@ cmd_restore() {
 # manifest 無しで復旧するモード（save する前にクラッシュ／強制終了した場合の受け皿）
 #   ~/.claude/projects/ の会話ログから「直近に更新された & いま動いていない」ものを拾って resume する
 cmd_recover() {
-  local dry=0 auto_confirm=0 rename=1 hours="$RECOVER_HOURS" yes=0 limit="$MAX_SESSIONS" pick=0 wave_size="$WAVE_SIZE"
+  local dry=0 auto_confirm=0 rename=1 recap=1 hours="$RECOVER_HOURS" yes=0 limit="$MAX_SESSIONS" pick=0 wave_size="$WAVE_SIZE"
   RESUME_MODE="as-is"
   while (( $# )); do
     case "$1" in
@@ -1448,6 +1448,8 @@ cmd_recover() {
         hours="$1" ;;
       --dry-run)      dry=1 ;;
       --yes)          yes=1 ;;
+      --recap)        recap=1 ;;
+      --no-recap)     recap=0 ;;
       --pick)         pick=1 ;;
       --auto-confirm) auto_confirm=1 ;;
       --no-rename)    rename=0 ;;
@@ -1656,6 +1658,7 @@ cmd_recover() {
     fi
   fi
 
+  local rc=0
   if (( VERIFY_TIMEOUT > 0 )); then
     print
     if (( wave_size > 0 )); then
@@ -1679,8 +1682,7 @@ cmd_recover() {
       if (( wave_failed )); then
         warn "RC 未登録の会話があります。以下で再接続を試してください:"
         info "claude-rc-reattach reconnect"
-        report_limit_remainder "$remainder_rows"
-        return 1
+        rc=1
       else
         ok "すべての会話の RC 登録を確認しました"
         info "claude.ai/code または モバイルアプリに新しいセッションとして表示されます"
@@ -1697,18 +1699,247 @@ cmd_recover() {
         warn "RC 未登録の会話があります。以下で再接続を試してください:"
         info "claude-rc-reattach reconnect"
         CONFIRM_DIALOG_ENTRIES=()
-        report_limit_remainder "$remainder_rows"
-        return 1
+        rc=1
       fi
       CONFIRM_DIALOG_ENTRIES=()
     fi
+    print
+    info "※ リモート側には復旧前の履歴が表示されないことがあります（ローカルの会話は継続しています）"
+    if (( recap )); then
+      send_recap "${v_entries[@]}" || true
+    else
+      info "  --no-recap 指定のため、要約送信は行いません"
+    fi
     report_limit_remainder "$remainder_rows"
+    return $rc
   else
     print
     info "確認方法:"
     info "  tmux attach -t $TMUX_SESSION     # 各ウィンドウのフッターに /rc active が出ていれば成功"
+    info "  --no-recap を付けていない場合も、RC 登録確認を無効化しているため要約は自動送信しません"
     report_limit_remainder "$remainder_rows"
   fi
+}
+
+# tmux の復元セッション内で、会話ログの最終更新が古い pane を閉じる
+cmd_prune() {
+  local idle=6 dry=0 yes=0
+  while (( $# )); do
+    case "$1" in
+      --idle)
+        shift
+        if [[ ! "${1:-}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+          err "--idle には時間（h、数値）を指定してください"
+          return 1
+        fi
+        idle="$1" ;;
+      --idle=*)
+        idle="${1#--idle=}"
+        if [[ ! "$idle" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+          err "--idle には時間（h、数値）を指定してください"
+          return 1
+        fi ;;
+      --dry-run) dry=1 ;;
+      --yes) yes=1 ;;
+      *) err "不明なオプション: $1"; return 1 ;;
+    esac
+    shift
+  done
+  need python3
+  need_tmux || return 1
+
+  if ! tmux has-session -t "=$TMUX_SESSION" 2>/dev/null; then
+    err "tmux セッション '$TMUX_SESSION' がありません（restore / recover で起動した復元セッションだけが対象です）"
+    return 1
+  fi
+
+  local rows candidates count ans
+  rows=$(tmux list-panes -s -t "=$TMUX_SESSION" -F '#{pane_id}'$'\t''#{pane_pid}'$'\t''#{pane_dead}'$'\t''#{window_id}'$'\t''#{window_name}'$'\t''#{@rc_sid}' 2>/dev/null)
+  if [[ -z "$rows" ]]; then
+    info "tmux セッション '$TMUX_SESSION' に pane がありません"
+    return 0
+  fi
+
+  candidates=$(PANE_ROWS="$rows" python3 - "$SESSIONS_DIR" "$PROJECTS_DIR" "$idle" <<'PY'
+import glob, json, os, re, subprocess, sys, time
+from datetime import datetime
+
+sessions_dir, projects_dir, idle_h = sys.argv[1], sys.argv[2], float(sys.argv[3])
+cutoff = time.time() - idle_h * 3600
+resume_re = re.compile(r"(?:--resume|-r)(?:=|\s+)([0-9a-fA-F-]{36})")
+
+panes = []
+for line in os.environ.get("PANE_ROWS", "").splitlines():
+    parts = line.split("\t")
+    if len(parts) < 6:
+        continue
+    pane_id, pane_pid, pane_dead, win_id, win_name, rc_sid = parts[:6]
+    try:
+        pane_pid_i = int(pane_pid)
+    except ValueError:
+        continue
+    if pane_dead == "1":
+        continue
+    panes.append({
+        "pane_id": pane_id,
+        "pane_pid": pane_pid_i,
+        "win_id": win_id,
+        "win_name": win_name,
+        "rc_sid": rc_sid.strip(),
+    })
+
+parent, args_of = {}, {}
+try:
+    raw = subprocess.run(["ps", "-ax", "-o", "pid=,ppid=,args="], capture_output=True, text=True).stdout
+except Exception:
+    raw = ""
+for line in raw.splitlines():
+    parts = line.split(None, 2)
+    if len(parts) < 3:
+        continue
+    try:
+        pid, ppid = int(parts[0]), int(parts[1])
+    except ValueError:
+        continue
+    parent[pid] = ppid
+    args_of[pid] = parts[2]
+
+def ancestor_depth(pid, target, limit=8):
+    depth = 0
+    while depth <= limit:
+        if pid == target:
+            return depth
+        if pid not in parent:
+            return None
+        pid = parent[pid]
+        depth += 1
+    return None
+
+states = []
+for path in sorted(glob.glob(os.path.join(sessions_dir, "*.json"))):
+    try:
+        d = json.load(open(path))
+    except Exception:
+        continue
+    if d.get("kind") != "interactive":
+        continue
+    pid = d.get("pid")
+    sid = d.get("sessionId")
+    if not isinstance(pid, int) or not sid:
+        continue
+    if pid not in parent or "claude" not in args_of.get(pid, "").lower():
+        continue
+    states.append((pid, sid, d.get("cwd") or "", d.get("name") or ""))
+
+def transcript_for(sid):
+    hits = glob.glob(os.path.join(projects_dir, "*", f"{sid}.jsonl"))
+    if not hits:
+        return ""
+    return max(hits, key=lambda p: os.path.getmtime(p))
+
+def sid_from_process_args(pane_pid):
+    best = None
+    for pid, args in args_of.items():
+        depth = ancestor_depth(pid, pane_pid)
+        if depth is None:
+            continue
+        if "claude" not in args.lower():
+            continue
+        match = resume_re.search(args)
+        if not match:
+            continue
+        cand = (depth, match.group(1))
+        if best is None or cand[0] < best[0]:
+            best = cand
+    return best[1] if best else ""
+
+def state_for_pane(pane_pid):
+    best = None
+    for pid, sid, cwd, name in states:
+        depth = ancestor_depth(pid, pane_pid)
+        if depth is None:
+            continue
+        cand = (depth, sid, cwd, name)
+        if best is None or cand[0] < best[0]:
+            best = cand
+    return best
+
+for pane in panes:
+    st = state_for_pane(pane["pane_pid"])
+    sid = pane["rc_sid"] or (st[1] if st else "") or sid_from_process_args(pane["pane_pid"])
+    if not sid:
+        continue
+    label = (st[3] if st and st[3] else "") or pane["win_name"] or sid
+    transcript = transcript_for(sid)
+    if not transcript:
+        continue
+    try:
+        mtime = os.path.getmtime(transcript)
+    except OSError:
+        continue
+    if mtime >= cutoff:
+        continue
+    age_h = int((time.time() - mtime) / 3600)
+    when = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M")
+    print("\t".join([
+        str(int(mtime)),
+        when,
+        str(age_h),
+        pane["pane_id"],
+        pane["win_id"],
+        pane["win_name"],
+        sid,
+        transcript,
+        label.replace("\t", " ").replace("\n", " "),
+    ]))
+PY
+)
+
+  count=$(print -r -- "$candidates" | sed '/^$/d' | wc -l | tr -d ' ')
+  if (( count == 0 )); then
+    ok "店じまい対象はありません（idle ${idle}h より古い復元paneなし）"
+    return 0
+  fi
+
+  print -- "店じまい候補（idle ${idle}h より古い会話ログ）:"
+  print -r -- "$candidates" | sort -n -t $'\t' -k1,1 | while IFS=$'\t' read -r _mtime when age_h pane_id _win_id win_name sid _transcript label; do
+    info "• ${label:-$win_name}  pane=$pane_id  最終更新=$when（${age_h}h前）  session=$sid"
+  done
+
+  if (( dry )); then
+    ok "${count}件を店じまいします（dry-run のため終了処理はしません）"
+    return 0
+  fi
+
+  if (( yes )); then
+    print -- "${count}件を店じまいします(会話の記録は残り、いつでも restore/recover で戻せます)"
+  else
+    printf "%s件を店じまいします(会話の記録は残り、いつでも restore/recover で戻せます)。続行しますか? [y/N]: " "$count"
+    read -r ans || ans=""
+    [[ "$ans" == [yY]* ]] || { warn "中止しました"; return 1; }
+  fi
+
+  local closed=0 killed=0 pane_id win_id win_name label sid _mtime when age_h _transcript
+  print -r -- "$candidates" | sort -n -t $'\t' -k1,1 | while IFS=$'\t' read -r _mtime when age_h pane_id win_id win_name sid _transcript label; do
+    if ! tmux display-message -p -t "$pane_id" '#{pane_id}' >/dev/null 2>&1; then
+      continue
+    fi
+    tmux send-keys -t "$pane_id" C-c 2>/dev/null || true
+    sleep 0.2
+    tmux send-keys -t "$pane_id" -l -- "/exit" 2>/dev/null || true
+    sleep 0.2
+    tmux send-keys -t "$pane_id" Enter 2>/dev/null || true
+    sleep 5
+    if tmux display-message -p -t "$pane_id" '#{pane_id}' >/dev/null 2>&1; then
+      tmux kill-window -t "$pane_id" 2>/dev/null || true
+      ok "${label:-$win_name}: /exit 後も残っていたため tmux window を閉じました"
+      (( killed++ )) || true
+    else
+      ok "${label:-$win_name}: 正常終了しました"
+      (( closed++ )) || true
+    fi
+  done
+  ok "完了: 正常終了 $closed 件 / kill-window $killed 件"
 }
 
 # restore 後に RC が未登録・切断状態になったセッションへ /remote-control を送って再接続する
@@ -1824,7 +2055,7 @@ cmd_switch() {
   while (( $# )); do
     case "$1" in
       --dry-run) dry=1; pass_opts+=("$1") ;;
-      --fork|--no-fork|--force|--no-rename|--no-inherit-perms|--inherit-bypass|--recap|--yes|--pick) pass_opts+=("$1") ;;
+      --fork|--no-fork|--force|--no-rename|--no-inherit-perms|--inherit-bypass|--recap|--no-recap|--yes|--pick) pass_opts+=("$1") ;;
       --limit|--resume-mode|--wave-size)
         pass_opts+=("$1")
         shift
@@ -1940,6 +2171,7 @@ COMMANDS:
   restore [options]  manifest の会話を tmux 内で resume して RC 再登録（切り替え「後」に実行）
   switch  [options]  save → logout → login → restore を一括実行
   recover [options]  manifest 無しで、直近に更新された会話ログから復旧（クラッシュ後の受け皿）
+  prune [options]    復元用 tmux セッション内の古い pane を正常終了して片付ける
   reconnect [--recap] tmux 内の RC 未登録セッションに /remote-control を送信して再接続
   help               このヘルプを表示
 
@@ -1953,9 +2185,10 @@ RESTORE/SWITCH OPTIONS:
   --inherit-bypass     bypass 系の権限モードも引き継ぐ
                        （--dangerously-skip-permissions / --permission-mode bypassPermissions。
                          既定では引き継がない。ps からの検出は誤検出し得るため）
-  --recap              RC 登録できた会話に「経緯を要約して」を 1 通送る
-                       （切り替え前の履歴はリモートに送られないため、要約で文脈を残す。
-                         reconnect でも使える。入力欄は空にしておくこと）
+  --recap              RC 登録できた会話に要約依頼を 1 通送る（既定）
+  --no-recap           要約依頼を送らない
+                       （切り替え前の履歴はリモートに送られないため、既定では要約で文脈を残す。
+                         入力欄は空にしておくこと）
   --limit <N>          起動する復元候補の上限（既定: $MAX_SESSIONS。0 で無制限）
   --pick               復元候補を番号付き一覧から対話選択する
   --wave-size <N>      N 件ずつ起動して RC 登録確認後に次の波へ進む
@@ -1974,6 +2207,8 @@ EXIT STATUS (restore / switch):
 RECOVER OPTIONS:
   --within <hours>     この時間内に更新された会話ログを対象にする（既定: $RECOVER_HOURS）
   --auto-confirm       起動後の確認ダイアログ（trust / Resume from summary）に Enter を自動送信
+  --recap              RC 登録できた会話に要約依頼を 1 通送る（既定）
+  --no-recap           要約依頼を送らない
   --limit <N>          起動する復元候補の上限（既定: $MAX_SESSIONS。0 で無制限）
   --pick               復元候補を番号付き一覧から対話選択する
   --wave-size <N>      N 件ずつ起動して RC 登録確認後に次の波へ進む
@@ -1983,6 +2218,11 @@ RECOVER OPTIONS:
                        波ごとの RC 未登録確認も自動続行する
   --no-rename          復帰セッションに名前を付けない
   --dry-run            候補一覧だけ表示して起動しない
+
+PRUNE OPTIONS:
+  --idle <hours>        この時間より会話ログの最終更新が古い復元paneを対象にする（既定: 6）
+  --dry-run            候補一覧だけ表示して終了処理はしない
+  --yes                店じまい確認を省略する
 
 ENVIRONMENT:
   CLAUDE_RC_MANIFEST       manifest の保存先（既定: $STATE_DIR/manifest.tsv）
@@ -1996,9 +2236,10 @@ ENVIRONMENT:
                            （既定: 60。0 で確認しない）
   CLAUDE_RC_STAGGER_SECS   restore で各セッションを起動する間隔の秒数
                            （既定: 3。credential の同時発行・同時失効の緩和用。0 で無効化）
-  CLAUDE_RC_RECAP_PROMPT   --recap で送るプロンプト（必ず 1 行で書くこと）
-                           （既定: これまでの会話の経緯と、いま取り組んでいることを
-                             5 行以内で要約してください。）
+  CLAUDE_RC_RECAP_PROMPT   recap で送るプロンプト（必ず 1 行で書くこと）
+                           （既定: アカウント切替で画面上の履歴が空になっています。
+                             これまでの会話の経緯・決定事項・いま取り組んでいる作業を
+                             10行以内で要約して表示してください。）
   CLAUDE_RC_RECOVER_HOURS  recover の既定の対象時間（既定: 6。--within で上書き）
   CLAUDE_RC_CONFIRM_WAIT   recover で確認ダイアログを見に行くまでの待ち秒数（既定: 10）
   CLAUDE_RC_MAX_SESSIONS   restore / recover で起動する復元候補の既定上限（既定: 10。0 で無制限）
@@ -2012,6 +2253,7 @@ case "${1:-help}" in
   restore)   shift; cmd_restore "$@" ;;
   switch)    shift; cmd_switch "$@" ;;
   recover)   shift; cmd_recover "$@" ;;
+  prune)     shift; cmd_prune "$@" ;;
   reconnect) shift; cmd_reconnect "$@" ;;
   -h|--help|help) usage ;;
   -v|--version)   print -- "$VERSION" ;;

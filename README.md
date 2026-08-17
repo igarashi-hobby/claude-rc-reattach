@@ -100,6 +100,7 @@ restore は `claude --resume <sessionId> --remote-control <会話名>` の形で
 | `restore` | 切り替え**後**（ログイン済み） | manifest の各会話を tmux 内で resume し、RC 再登録と登録確認まで行う |
 | `switch` | — | save → logout → login → restore を対話形式で一括実行 |
 | `recover` | save し損ねた時 | manifest を使わず、直近に更新された会話ログから復旧候補を探して resume |
+| `prune` | 復帰後いつでも | 復元用 tmux セッション内で、会話ログの最終更新が古い pane を正常終了して片付ける |
 | `reconnect` | restore 後いつでも | tmux 内の RC 未登録セッションに `/remote-control` を送信して再接続（`--recap` 可） |
 
 ### switch（一括実行）
@@ -127,7 +128,8 @@ claude-rc-reattach switch
 | `--no-rename` | 復帰セッションに `-restored-MMDD` の名前を付けない |
 | `--no-inherit-perms` | save 時に検出した権限モードを引き継がない |
 | `--inherit-bypass` | bypass 系の権限モードも引き継ぐ（既定では引き継がない。後述） |
-| `--recap` | RC 登録できた会話に「経緯を要約して」を 1 通送る（リモート側に文脈を残すため。`reconnect` でも使える） |
+| `--recap` | RC 登録できた会話に要約依頼を 1 通送る（既定） |
+| `--no-recap` | 要約依頼を送らない |
 | `--limit <N>` | 起動する復元候補の上限（既定: `CLAUDE_RC_MAX_SESSIONS` / 10。`0` で無制限） |
 | `--pick` | 復元候補を番号付き一覧から対話選択する（非対話環境ではエラー） |
 | `--wave-size <N>` | `N` 件ずつ起動し、各波の RC 登録確認後に次の波へ進む（既定: `CLAUDE_RC_WAVE_SIZE` / 3。`0` で従来どおり一括） |
@@ -259,20 +261,28 @@ Claude Code 内部ではこれを「クロスアカウント抑止（cross-accou
 **回避策としての会話ログの書き換えは行いません。**
 技術的には該当レコードを削れば抑止を外せますが、それは「組織 A の会話内容を組織 B のサーバーへ黙って送る」という、まさにこの保護が防いでいる事象を起こします。
 
-#### 代わりに: `--recap` で要約を送る
+#### 代わりに: recap で要約を送る
 
 抑止されるのは**過去ログの一括アップロードだけ**で、RC 確立後の新しいやりとりは通常どおり双方向に同期されます。
-そこで復帰直後に要約を 1 通送っておけば、リモート側にも文脈が残ります:
+そこで restore / switch / recover では、RC 登録を確認できた会話に既定で要約依頼を 1 通送ります。
+リモート側にも文脈を残すためです:
 
 ```bash
-claude-rc-reattach restore --recap
-# RC 登録を確認できた会話にだけ「これまでの会話の経緯と、いま取り組んでいることを
-# 5 行以内で要約してください。」を送信します（RC 未登録の会話には送りません）
+claude-rc-reattach restore
+# RC 登録を確認できた会話にだけ、既定の要約プロンプトを送信します
+# （RC 未登録の会話には送りません）
 ```
 
-`switch --recap` / `reconnect --recap` でも同じように使えます。
+送信しない場合は `--no-recap` を付けます。
+`reconnect` は再接続した会話だけに送るため、従来どおり `reconnect --recap` のときだけ送信します。
 プロンプトは環境変数 `CLAUDE_RC_RECAP_PROMPT` で変更できます（送信後すぐ Enter を打つため、必ず 1 行で書いてください）。
 `reconnect` と同じくキー送信で行うため、**対象ウィンドウの入力欄は空にしておいてください**。
+
+既定プロンプト:
+
+```text
+アカウント切替で画面上の履歴が空になっています。これまでの会話の経緯・決定事項・いま取り組んでいる作業を10行以内で要約して表示してください。
+```
 
 ### recover（save し損ねた時の復旧）
 
@@ -312,6 +322,7 @@ $ claude-rc-reattach recover --dry-run
 | `--resume-mode as-is\|summary` | 「Resume full session as-is」ダイアログの選択（既定: `as-is`） |
 | `--yes` | メモリ予算の確認プロンプトを省略 |
 | `--no-rename` | 復帰セッションに名前を付けない |
+| `--no-recap` | RC 登録後の要約依頼を送らない |
 | `--dry-run` | 候補一覧だけ表示して起動しない |
 
 **確認ダイアログについて**:
@@ -324,6 +335,32 @@ recover は manifest 経由ではないため、起動後に trust 確認（`Do 
 
 `--auto-confirm` を付けると Enter を自動送信して進めます（既定の選択肢を選ぶため、最大 3 段まで）。
 **どのフォルダを信頼するかを自動承認することになるため、身に覚えのないディレクトリが候補に出ていないかを `--dry-run` で確認してから使ってください。**
+
+### prune（古い復元 pane の店じまい）
+
+```bash
+# まず候補だけ確認する
+claude-rc-reattach prune --dry-run
+
+# 6時間以上更新されていない復元 pane を閉じる
+claude-rc-reattach prune
+
+# 12時間以上に広げ、確認を省略する
+claude-rc-reattach prune --idle 12 --yes
+```
+
+`prune` は tmux の復元用セッション（既定: `rc-restore` / `CLAUDE_RC_TMUX_SESSION`）配下の pane だけを見ます。
+通常のターミナルで動いている Claude Code や、別の tmux セッションには触りません。
+
+各 pane について会話IDを `@rc_sid`、Claude Code の状態ファイル、`--resume` 引数から特定し、対応する会話ログ（`~/.claude/projects/*/<sessionId>.jsonl`）の最終更新が `--idle` 時間より古いものを列挙します。
+実行時は `N件を店じまいします(会話の記録は残り、いつでも restore/recover で戻せます)` と確認し、対象 pane に `C-c` → `/exit` → Enter を送ります。
+5秒待って残っている場合だけ、その tmux window を閉じます。
+
+| オプション | 動作 |
+|---|---|
+| `--idle <hours>` | 対象にする最終更新の古さ（既定: 6） |
+| `--dry-run` | 候補一覧だけ表示して終了処理はしない |
+| `--yes` | 店じまい確認を省略 |
 
 ### 権限モードの引き継ぎ（--dangerously-skip-permissions 等）
 
@@ -394,7 +431,7 @@ CLAUDE_RC_CLAUDE_ARGS="--dangerously-skip-permissions --append-system-prompt '�
 | `CLAUDE_RC_MAX_AGE_DAYS` | `0` | 最終チャットからこの日数を超えた会話を restore で skip する（`0` = skip しない。1 以上で有効） |
 | `CLAUDE_RC_VERIFY_TIMEOUT` | `60` | restore / reconnect 後に RC 登録を確認する最大秒数（`0` で確認しない） |
 | `CLAUDE_RC_STAGGER_SECS` | `3` | restore で各セッションを起動する間隔の秒数（credential の同時発行・同時失効の緩和用。`0` で無効化） |
-| `CLAUDE_RC_RECAP_PROMPT` | `これまでの会話の経緯と、いま取り組んでいることを 5 行以内で要約してください。` | `--recap` で送るプロンプト（必ず 1 行で書くこと） |
+| `CLAUDE_RC_RECAP_PROMPT` | `アカウント切替で画面上の履歴が空になっています。これまでの会話の経緯・決定事項・いま取り組んでいる作業を10行以内で要約して表示してください。` | recap で送るプロンプト（必ず 1 行で書くこと） |
 | `CLAUDE_RC_RECOVER_HOURS` | `6` | recover が対象とする時間（`--within` を付けた場合はそちらが優先） |
 | `CLAUDE_RC_CONFIRM_WAIT` | `10` | recover で確認ダイアログを見に行くまでの待ち秒数 |
 | `CLAUDE_RC_MAX_SESSIONS` | `10` | restore / recover で起動する復元候補の既定上限（`0` = 無制限） |
@@ -430,7 +467,7 @@ RC 接続中かどうかは、Claude Code が実行中セッションごとに�
   旧アカウント側のセッション一覧には非アクティブなエントリが残りますが、これは仕様上消せません
 - **リモート側には切り替え前のやりとりが表示されません。**
   Claude Code のクロスアカウント抑止によるもので、このツールでは変えられません。
-  復帰後の新しいやりとりは通常どおり同期されるため、`--recap` で要約を 1 通送っておくと文脈が残ります（[詳細](#リモート側に切り替え前の履歴は表示されない)）
+  復帰後の新しいやりとりは通常どおり同期されるため、既定の recap で要約を 1 通送って文脈を残します（[詳細](#リモート側に切り替え前の履歴は表示されない)）
 - **Claude Desktop アプリのアカウントは切り替わりません。**
   Desktop は CLI とは別に認証を持つ（独自の OAuth トークンと同梱の Claude Code を使う）ため、`claude auth logout` / `login` の影響を受けません。
   Desktop も使っている場合は、アプリ側でサインアウト → 新アカウントでサインインしてください。
@@ -469,8 +506,8 @@ RC 接続中かどうかは、Claude Code が実行中セッションごとに�
 | save し損ねたまま Mac がクラッシュした | `claude-rc-reattach recover --dry-run` で復旧候補を確認し、問題なければ `recover` を実行（上記「recover」参照） |
 | 「最終チャットが N 日前」で skip される | `CLAUDE_RC_MAX_AGE_DAYS` に 1 以上を指定した場合の動作です。既定（`0`）では古い会話も復帰します |
 | 復帰後に `--dangerously-skip-permissions` が外れている | bypass 系は既定で引き継ぎません。`--inherit-bypass` を付けるか、`CLAUDE_RC_CLAUDE_ARGS` で明示指定してください。セッション中に `/permissions` で変更した場合は検出できません（上記「権限モードの引き継ぎ」参照） |
-| スマホ / claude.ai/code に切り替え前のやりとりが出ない | 仕様です（Claude Code のクロスアカウント抑止）。`--recap` を付けて実行するか、復帰したセッションで要約を 1 通送ってください（上記「[リモート側に切り替え前の履歴は表示されない](#リモート側に切り替え前の履歴は表示されない)」参照） |
-| `list` に `⚑ リモート履歴は抑止済み` と出る | その会話は既にクロスアカウント抑止が確定しており、以後どのアカウントで開いてもリモートに履歴は出ません。`--recap` で文脈を補ってください |
+| スマホ / claude.ai/code に切り替え前のやりとりが出ない | 仕様です（Claude Code のクロスアカウント抑止）。restore / switch / recover は既定で recap を送るため、対象ウィンドウの入力欄が空か確認してください（上記「[リモート側に切り替え前の履歴は表示されない](#リモート側に切り替え前の履歴は表示されない)」参照） |
+| `list` に `⚑ リモート履歴は抑止済み` と出る | その会話は既にクロスアカウント抑止が確定しており、以後どのアカウントで開いてもリモートに履歴は出ません。recap で文脈を補ってください |
 | Claude Desktop アプリが旧アカウントのまま | このツールは CLI の認証だけを切り替えます。Desktop はアプリ側でサインアウト → 新アカウントでサインインしてください |
 
 ## ライセンス
