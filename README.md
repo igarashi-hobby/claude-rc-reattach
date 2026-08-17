@@ -316,7 +316,7 @@ $ claude-rc-reattach recover --dry-run
 
 | オプション | 動作 |
 |---|---|
-| `--within <hours>` | 対象とする時間（既定: 120=5日） |
+| `--within <hours>` | 対象とする時間（既定: 6） |
 | `--auto-confirm` | 起動後の確認ダイアログに Enter を自動送信 |
 | `--limit <N>` | 起動する復元候補の上限（既定: `CLAUDE_RC_MAX_SESSIONS` / 10。`0` で無制限） |
 | `--resume-mode as-is\|summary` | 「Resume full session as-is」ダイアログの選択（既定: `as-is`） |
