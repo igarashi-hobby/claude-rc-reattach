@@ -27,6 +27,7 @@ STAGGER_SECS="${CLAUDE_RC_STAGGER_SECS:-3}"
 RECOVER_HOURS="${CLAUDE_RC_RECOVER_HOURS:-6}"
 CONFIRM_WAIT="${CLAUDE_RC_CONFIRM_WAIT:-10}"
 MAX_SESSIONS="${CLAUDE_RC_MAX_SESSIONS:-10}"
+WAVE_SIZE="${CLAUDE_RC_WAVE_SIZE:-3}"
 CONFIRM_PENDING=0   # handle_confirm_dialogs の結果（ダイアログ待ちの pane 数）
 RESUME_MODE="as-is"
 CONFIRM_DIALOG_ENTRIES=()
@@ -65,6 +66,10 @@ fi
 if [[ ! "$MAX_SESSIONS" =~ ^[0-9]+$ ]]; then
   warn "CLAUDE_RC_MAX_SESSIONS='$MAX_SESSIONS' は数値ではないため既定値 10 を使います"
   MAX_SESSIONS=10
+fi
+if [[ ! "$WAVE_SIZE" =~ ^[0-9]+$ ]]; then
+  warn "CLAUDE_RC_WAVE_SIZE='$WAVE_SIZE' は数値ではないため既定値 3 を使います"
+  WAVE_SIZE=3
 fi
 
 # tmux はセッション名の . と : を _ に置き換えて保存するため、そのままだと
@@ -352,6 +357,101 @@ wait_rc_registration() {
     esac
   done
   return $(( ng > 0 ))
+}
+
+count_unregistered_entries() {
+  local -a entries panes
+  entries=("$@")
+  local e pane out
+  panes=()
+  for e in "${entries[@]}"; do
+    pane="${e%%$'\t'*}"
+    [[ -n "$pane" ]] && panes+=("$pane")
+  done
+  (( ${#panes} )) || { print -- 0; return 0; }
+  out=$(pane_rc_status "${panes[@]}")
+  print -r -- "$out" | awk -F '\t' '$2 != "connected" { count++ } END { print count + 0 }'
+}
+
+confirm_wave_continue() {
+  local count="$1" yes="$2" ans
+  (( count > 0 )) || return 0
+  if (( yes )); then
+    warn "${count}件がRC未登録のまま。--yes のため続行します"
+    return 0
+  fi
+  printf "%s件がRC未登録のまま。続行しますか(y/N): " "$count"
+  read -r ans || ans=""
+  [[ "$ans" == [yY]* ]]
+}
+
+pick_rows() {
+  local mode="$1" rows="$2" ans selected
+  if [[ ! -t 0 ]]; then
+    err "--pick は対話環境（標準入力が tty）でのみ使えます"
+    err "非対話では --pick を外して通常モードで実行してください"
+    return 1
+  fi
+  [[ -n "$rows" ]] || return 0
+  print -- "復元候補:" >&2
+  print -r -- "$rows" | python3 -c '
+import datetime, sys
+mode = sys.argv[1]
+for i, line in enumerate(sys.stdin.read().splitlines(), 1):
+    if not line:
+        continue
+    if mode == "restore":
+        parts = line.split("\t", 2)
+        epoch = parts[0] if len(parts) > 0 else ""
+        label = parts[1] if len(parts) > 1 else ""
+        raw = parts[2].split("\t") if len(parts) > 2 else []
+        cwd = raw[1] if len(raw) > 1 else ""
+        try:
+            when = datetime.datetime.fromtimestamp(int(epoch)).strftime("%Y-%m-%d %H:%M") if int(epoch) > 0 else "-"
+        except Exception:
+            when = "-"
+        name = label or (raw[0] if raw else "")
+    else:
+        parts = line.split("\t")
+        when = parts[0] if len(parts) > 0 else "-"
+        sid = parts[1] if len(parts) > 1 else ""
+        cwd = parts[2] if len(parts) > 2 else ""
+        title = parts[4] if len(parts) > 4 else ""
+        name = title or sid
+    print(f"{i}\t{when}\t{name or \"(無名)\"}\t{cwd or \"(不明)\"}")
+' "$mode" >&2
+  printf "復元する番号をカンマ区切りで入力(例: 1,3,5)。a=全部、q=中止: " >&2
+  read -r ans || ans=""
+  case "$ans" in
+    [aA]) print -r -- "$rows"; return 0 ;;
+    [qQ]|"") err "選択を中止しました"; return 1 ;;
+  esac
+  selected=$(print -r -- "$rows" | PICK_SELECTION="$ans" python3 -c '
+import os, sys
+raw = [line for line in sys.stdin.read().splitlines() if line]
+sel = os.environ.get("PICK_SELECTION", "")
+nums = []
+try:
+    for part in sel.split(","):
+        part = part.strip()
+        if not part:
+            raise ValueError
+        n = int(part)
+        if n < 1 or n > len(raw):
+            raise ValueError
+        if n not in nums:
+            nums.append(n)
+except ValueError:
+    print("番号指定が不正です", file=sys.stderr)
+    sys.exit(2)
+for n in nums:
+    print(raw[n - 1])
+')
+  if (( $? != 0 )); then
+    err "復元候補の選択に失敗しました"
+    return 1
+  fi
+  print -r -- "$selected"
 }
 
 # RC 登録済みの pane に「要約して」を 1 通送る（--recap）
@@ -914,7 +1014,7 @@ cmd_save() {
 }
 
 cmd_restore() {
-  local fork=1 dry=0 inherit_perms=1 force=0 rename=1 recap=0 inherit_bypass=0 yes=0 limit="$MAX_SESSIONS"
+  local fork=1 dry=0 inherit_perms=1 force=0 rename=1 recap=0 inherit_bypass=0 yes=0 limit="$MAX_SESSIONS" pick=0 wave_size="$WAVE_SIZE"
   RESUME_MODE="as-is"
   while (( $# )); do
     case "$1" in
@@ -927,6 +1027,7 @@ cmd_restore() {
       --no-inherit-perms) inherit_perms=0 ;;
       --inherit-bypass)   inherit_bypass=1 ;;
       --recap)   recap=1 ;;
+      --pick)    pick=1 ;;
       --limit)
         shift
         if [[ ! "${1:-}" =~ ^[0-9]+$ ]]; then
@@ -938,6 +1039,19 @@ cmd_restore() {
         limit="${1#--limit=}"
         if [[ ! "$limit" =~ ^[0-9]+$ ]]; then
           err "--limit には件数（数値）を指定してください"
+          return 1
+        fi ;;
+      --wave-size)
+        shift
+        if [[ ! "${1:-}" =~ ^[0-9]+$ ]]; then
+          err "--wave-size には件数（数値）を指定してください"
+          return 1
+        fi
+        wave_size="$1" ;;
+      --wave-size=*)
+        wave_size="${1#--wave-size=}"
+        if [[ ! "$wave_size" =~ ^[0-9]+$ ]]; then
+          err "--wave-size には件数（数値）を指定してください"
           return 1
         fi ;;
       --resume-mode)
@@ -1046,6 +1160,9 @@ cmd_restore() {
     limited_rows="$manifest_rows"
     remainder_rows=""
   fi
+  if (( pick )); then
+    limited_rows=$(pick_rows restore "$limited_rows") || return 1
+  fi
   planned_count=$(print -r -- "$limited_rows" | sed '/^$/d' | wc -l | tr -d ' ')
   if (( ! dry )); then
     confirm_memory_budget "$planned_count" "$yes" || {
@@ -1056,13 +1173,16 @@ cmd_restore() {
 
   local resumed=0 skipped=0 now
   now=$(date +%s)
-  local sid cwd name opid perm label restored_name rc_name transcript win cmd_str last_epoch age_days pane_info pane_id pane_pid line sort_epoch sort_label
-  local -a claude_cmd perm_args v_entries d_entries f
+  local sid cwd name opid perm label restored_name rc_name transcript win cmd_str last_epoch age_days pane_info pane_id pane_pid line sort_epoch sort_label wave_rc unregistered
+  local -a claude_cmd perm_args v_entries d_entries wave_v_entries wave_d_entries f
   # 同じ会話を 2 回起動すると 1 本の会話ログに両方が書き込まれるため、実行内でも重複を弾く
   # （古いバージョンが書いた manifest や手で編集した manifest に重複が残っていることがある）
   typeset -A seen_sids
   v_entries=()
   d_entries=()
+  wave_v_entries=()
+  wave_d_entries=()
+  local wave_failed=0 aborted=0
   while IFS=$'\t' read -r sort_epoch sort_label line; do
     [[ -z "$line" ]] && continue
     # IFS=$'\t' read は連続タブを畳んで列をずらすため使わない（無名セッション対策）
@@ -1194,9 +1314,37 @@ cmd_restore() {
     pane_pid="${pane_info#*$'\t'}"
     v_entries+=("${pane_pid}"$'\t'"$label")
     d_entries+=("${pane_id}"$'\t'"$label")
+    wave_v_entries+=("${pane_pid}"$'\t'"$label")
+    wave_d_entries+=("${pane_id}"$'\t'"$label")
     ok "$label: 起動しました（tmux window: $win）"
     (( resumed++ )) || true
+    if (( VERIFY_TIMEOUT > 0 && wave_size > 0 && ${#wave_v_entries} >= wave_size )); then
+      print
+      print -- "── RC 登録の確認（波 ${#wave_v_entries} 件 / 最大 ${VERIFY_TIMEOUT} 秒待機） ──"
+      CONFIRM_DIALOG_ENTRIES=("${wave_d_entries[@]}")
+      wait_rc_registration "$VERIFY_TIMEOUT" "${wave_v_entries[@]}"
+      wave_rc=$?
+      CONFIRM_DIALOG_ENTRIES=()
+      if (( wave_rc != 0 )); then
+        unregistered=$(count_unregistered_entries "${wave_v_entries[@]}")
+        if confirm_wave_continue "$unregistered" "$yes"; then
+          wave_failed=1
+        else
+          aborted=1
+          break
+        fi
+      fi
+      wave_v_entries=()
+      wave_d_entries=()
+    fi
   done <<< "$limited_rows"
+
+  if (( aborted )); then
+    print
+    err "波状起動を中断しました"
+    report_limit_remainder "$remainder_rows"
+    return 1
+  fi
 
   print
   ok "完了: 起動 $resumed 件 / skip $skipped 件"
@@ -1220,20 +1368,49 @@ cmd_restore() {
   # 失敗・切断されることがあるため、状態ファイルの bridgeSessionId で実測確認する
   if (( VERIFY_TIMEOUT > 0 )); then
     print
-    print -- "── RC 登録の確認（最大 ${VERIFY_TIMEOUT} 秒待機） ──"
-    CONFIRM_DIALOG_ENTRIES=("${d_entries[@]}")
-    if wait_rc_registration "$VERIFY_TIMEOUT" "${v_entries[@]}"; then
-      print
-      ok "すべての会話の RC 登録を確認しました"
-      info "claude.ai/code または モバイルアプリに新しいセッションとして表示されます"
+    if (( wave_size > 0 )); then
+      if (( ${#wave_v_entries} > 0 )); then
+        print -- "── RC 登録の確認（波 ${#wave_v_entries} 件 / 最大 ${VERIFY_TIMEOUT} 秒待機） ──"
+        CONFIRM_DIALOG_ENTRIES=("${wave_d_entries[@]}")
+        wait_rc_registration "$VERIFY_TIMEOUT" "${wave_v_entries[@]}"
+        wave_rc=$?
+        CONFIRM_DIALOG_ENTRIES=()
+        if (( wave_rc != 0 )); then
+          unregistered=$(count_unregistered_entries "${wave_v_entries[@]}")
+          if confirm_wave_continue "$unregistered" "$yes"; then
+            wave_failed=1
+          else
+            err "波状起動を中断しました"
+            report_limit_remainder "$remainder_rows"
+            return 1
+          fi
+        fi
+      fi
+      if (( wave_failed )); then
+        warn "RC 未登録の会話があります。以下で再接続を試してください:"
+        info "claude-rc-reattach reconnect"
+        info "（または tmux attach -t $TMUX_SESSION で該当ウィンドウを開き、手動で /remote-control を実行）"
+        rc=1
+      else
+        ok "すべての会話の RC 登録を確認しました"
+        info "claude.ai/code または モバイルアプリに新しいセッションとして表示されます"
+      fi
     else
-      print
-      warn "RC 未登録の会話があります。以下で再接続を試してください:"
-      info "claude-rc-reattach reconnect"
-      info "（または tmux attach -t $TMUX_SESSION で該当ウィンドウを開き、手動で /remote-control を実行）"
-      rc=1
+      print -- "── RC 登録の確認（最大 ${VERIFY_TIMEOUT} 秒待機） ──"
+      CONFIRM_DIALOG_ENTRIES=("${d_entries[@]}")
+      if wait_rc_registration "$VERIFY_TIMEOUT" "${v_entries[@]}"; then
+        print
+        ok "すべての会話の RC 登録を確認しました"
+        info "claude.ai/code または モバイルアプリに新しいセッションとして表示されます"
+      else
+        print
+        warn "RC 未登録の会話があります。以下で再接続を試してください:"
+        info "claude-rc-reattach reconnect"
+        info "（または tmux attach -t $TMUX_SESSION で該当ウィンドウを開き、手動で /remote-control を実行）"
+        rc=1
+      fi
+      CONFIRM_DIALOG_ENTRIES=()
     fi
-    CONFIRM_DIALOG_ENTRIES=()
   else
     print
     info "確認方法:"
@@ -1258,7 +1435,7 @@ cmd_restore() {
 # manifest 無しで復旧するモード（save する前にクラッシュ／強制終了した場合の受け皿）
 #   ~/.claude/projects/ の会話ログから「直近に更新された & いま動いていない」ものを拾って resume する
 cmd_recover() {
-  local dry=0 auto_confirm=0 rename=1 hours="$RECOVER_HOURS" yes=0 limit="$MAX_SESSIONS"
+  local dry=0 auto_confirm=0 rename=1 hours="$RECOVER_HOURS" yes=0 limit="$MAX_SESSIONS" pick=0 wave_size="$WAVE_SIZE"
   RESUME_MODE="as-is"
   while (( $# )); do
     case "$1" in
@@ -1271,6 +1448,7 @@ cmd_recover() {
         hours="$1" ;;
       --dry-run)      dry=1 ;;
       --yes)          yes=1 ;;
+      --pick)         pick=1 ;;
       --auto-confirm) auto_confirm=1 ;;
       --no-rename)    rename=0 ;;
       --limit)
@@ -1284,6 +1462,19 @@ cmd_recover() {
         limit="${1#--limit=}"
         if [[ ! "$limit" =~ ^[0-9]+$ ]]; then
           err "--limit には件数（数値）を指定してください"
+          return 1
+        fi ;;
+      --wave-size)
+        shift
+        if [[ ! "${1:-}" =~ ^[0-9]+$ ]]; then
+          err "--wave-size には件数（数値）を指定してください"
+          return 1
+        fi
+        wave_size="$1" ;;
+      --wave-size=*)
+        wave_size="${1#--wave-size=}"
+        if [[ ! "$wave_size" =~ ^[0-9]+$ ]]; then
+          err "--wave-size には件数（数値）を指定してください"
           return 1
         fi ;;
       --resume-mode)
@@ -1322,6 +1513,9 @@ cmd_recover() {
     limited_rows="$rows"
     remainder_rows=""
   fi
+  if (( pick )); then
+    limited_rows=$(pick_rows recover "$limited_rows") || return 1
+  fi
   planned_count=$(print -r -- "$limited_rows" | sed '/^$/d' | wc -l | tr -d ' ')
   if (( ! dry )); then
     confirm_memory_budget "$planned_count" "$yes" || {
@@ -1343,11 +1537,14 @@ cmd_recover() {
   print -- "復旧候補（直近 ${hours} 時間・実行中のものを除く）:"
   # 注意: zsh ではループ内で `local` を再宣言すると変数の中身が出力されるため、
   # ループで使う変数はここでまとめて宣言する
-  local when sid cwd proj title label win cmd_str pane_info pane_id pane_pid last_proj="" transcript
+  local when sid cwd proj title label win cmd_str pane_info pane_id pane_pid last_proj="" transcript wave_rc unregistered
   local recovered=0 skipped=0
-  local -a claude_cmd v_entries d_entries
+  local -a claude_cmd v_entries d_entries wave_v_entries wave_d_entries
   v_entries=()
   d_entries=()
+  wave_v_entries=()
+  wave_d_entries=()
+  local wave_failed=0 aborted=0
   while IFS=$'\t' read -r when sid cwd proj title; do
     [[ -z "$sid" ]] && continue
     label="${title:-$sid}"
@@ -1392,9 +1589,42 @@ cmd_recover() {
     pane_pid="${pane_info#*$'\t'}"
     v_entries+=("${pane_pid}"$'\t'"$label")
     d_entries+=("${pane_id}"$'\t'"$label")
+    wave_v_entries+=("${pane_pid}"$'\t'"$label")
+    wave_d_entries+=("${pane_id}"$'\t'"$label")
     ok "$label: 起動しました（tmux window: $win）"
     (( recovered++ )) || true
+    if (( VERIFY_TIMEOUT > 0 && wave_size > 0 && ${#wave_v_entries} >= wave_size )); then
+      sleep "$CONFIRM_WAIT"
+      handle_confirm_dialogs "$auto_confirm" "$RESUME_MODE" "${wave_d_entries[@]}"
+      if (( CONFIRM_PENDING > 0 )); then
+        warn "${CONFIRM_PENDING} 個のセッションが確認ダイアログ待ちです"
+      fi
+      print
+      print -- "── RC 登録の確認（波 ${#wave_v_entries} 件 / 最大 ${VERIFY_TIMEOUT} 秒待機） ──"
+      CONFIRM_DIALOG_ENTRIES=("${wave_d_entries[@]}")
+      wait_rc_registration "$VERIFY_TIMEOUT" "${wave_v_entries[@]}"
+      wave_rc=$?
+      CONFIRM_DIALOG_ENTRIES=()
+      if (( wave_rc != 0 )); then
+        unregistered=$(count_unregistered_entries "${wave_v_entries[@]}")
+        if confirm_wave_continue "$unregistered" "$yes"; then
+          wave_failed=1
+        else
+          aborted=1
+          break
+        fi
+      fi
+      wave_v_entries=()
+      wave_d_entries=()
+    fi
   done <<< "$limited_rows"
+
+  if (( aborted )); then
+    print
+    err "波状起動を中断しました"
+    report_limit_remainder "$remainder_rows"
+    return 1
+  fi
 
   print
   if (( dry )); then
@@ -1410,33 +1640,68 @@ cmd_recover() {
 
   # restore と違い trust ダイアログや「Resume from summary」で止まることがある
   # （manifest 経由でないぶん、最後に開いた状態が読めないため）
-  sleep "$CONFIRM_WAIT"
-  handle_confirm_dialogs "$auto_confirm" "$RESUME_MODE" "${d_entries[@]}"
-  if (( CONFIRM_PENDING > 0 )); then
-    print
-    warn "${CONFIRM_PENDING} 個のセッションが確認ダイアログ待ちです。--auto-confirm で自動応答できます"
-    info "（または tmux attach -t $TMUX_SESSION でウィンドウを開き、手動で Enter）"
-    report_limit_remainder "$remainder_rows"
-    return 1
+  if (( wave_size == 0 || VERIFY_TIMEOUT == 0 || ${#wave_d_entries} > 0 )); then
+    sleep "$CONFIRM_WAIT"
+    if (( wave_size > 0 && VERIFY_TIMEOUT > 0 )); then
+      handle_confirm_dialogs "$auto_confirm" "$RESUME_MODE" "${wave_d_entries[@]}"
+    else
+      handle_confirm_dialogs "$auto_confirm" "$RESUME_MODE" "${d_entries[@]}"
+    fi
+    if (( CONFIRM_PENDING > 0 )); then
+      print
+      warn "${CONFIRM_PENDING} 個のセッションが確認ダイアログ待ちです。--auto-confirm で自動応答できます"
+      info "（または tmux attach -t $TMUX_SESSION でウィンドウを開き、手動で Enter）"
+      report_limit_remainder "$remainder_rows"
+      return 1
+    fi
   fi
 
   if (( VERIFY_TIMEOUT > 0 )); then
     print
-    print -- "── RC 登録の確認（最大 ${VERIFY_TIMEOUT} 秒待機） ──"
-    CONFIRM_DIALOG_ENTRIES=("${d_entries[@]}")
-    if wait_rc_registration "$VERIFY_TIMEOUT" "${v_entries[@]}"; then
-      print
-      ok "すべての会話の RC 登録を確認しました"
-      info "claude.ai/code または モバイルアプリに新しいセッションとして表示されます"
+    if (( wave_size > 0 )); then
+      if (( ${#wave_v_entries} > 0 )); then
+        print -- "── RC 登録の確認（波 ${#wave_v_entries} 件 / 最大 ${VERIFY_TIMEOUT} 秒待機） ──"
+        CONFIRM_DIALOG_ENTRIES=("${wave_d_entries[@]}")
+        wait_rc_registration "$VERIFY_TIMEOUT" "${wave_v_entries[@]}"
+        wave_rc=$?
+        CONFIRM_DIALOG_ENTRIES=()
+        if (( wave_rc != 0 )); then
+          unregistered=$(count_unregistered_entries "${wave_v_entries[@]}")
+          if confirm_wave_continue "$unregistered" "$yes"; then
+            wave_failed=1
+          else
+            err "波状起動を中断しました"
+            report_limit_remainder "$remainder_rows"
+            return 1
+          fi
+        fi
+      fi
+      if (( wave_failed )); then
+        warn "RC 未登録の会話があります。以下で再接続を試してください:"
+        info "claude-rc-reattach reconnect"
+        report_limit_remainder "$remainder_rows"
+        return 1
+      else
+        ok "すべての会話の RC 登録を確認しました"
+        info "claude.ai/code または モバイルアプリに新しいセッションとして表示されます"
+      fi
     else
-      print
-      warn "RC 未登録の会話があります。以下で再接続を試してください:"
-      info "claude-rc-reattach reconnect"
+      print -- "── RC 登録の確認（最大 ${VERIFY_TIMEOUT} 秒待機） ──"
+      CONFIRM_DIALOG_ENTRIES=("${d_entries[@]}")
+      if wait_rc_registration "$VERIFY_TIMEOUT" "${v_entries[@]}"; then
+        print
+        ok "すべての会話の RC 登録を確認しました"
+        info "claude.ai/code または モバイルアプリに新しいセッションとして表示されます"
+      else
+        print
+        warn "RC 未登録の会話があります。以下で再接続を試してください:"
+        info "claude-rc-reattach reconnect"
+        CONFIRM_DIALOG_ENTRIES=()
+        report_limit_remainder "$remainder_rows"
+        return 1
+      fi
       CONFIRM_DIALOG_ENTRIES=()
-      report_limit_remainder "$remainder_rows"
-      return 1
     fi
-    CONFIRM_DIALOG_ENTRIES=()
     report_limit_remainder "$remainder_rows"
   else
     print
@@ -1559,13 +1824,13 @@ cmd_switch() {
   while (( $# )); do
     case "$1" in
       --dry-run) dry=1; pass_opts+=("$1") ;;
-      --fork|--no-fork|--force|--no-rename|--no-inherit-perms|--inherit-bypass|--recap|--yes) pass_opts+=("$1") ;;
-      --limit|--resume-mode)
+      --fork|--no-fork|--force|--no-rename|--no-inherit-perms|--inherit-bypass|--recap|--yes|--pick) pass_opts+=("$1") ;;
+      --limit|--resume-mode|--wave-size)
         pass_opts+=("$1")
         shift
         [[ -n "${1:-}" ]] || { err "${pass_opts[-1]} には値が必要です"; return 1; }
         pass_opts+=("$1") ;;
-      --limit=*|--resume-mode=*) pass_opts+=("$1") ;;
+      --limit=*|--resume-mode=*|--wave-size=*) pass_opts+=("$1") ;;
       *) err "不明なオプション: $1"; return 1 ;;
     esac
     shift
@@ -1692,8 +1957,12 @@ RESTORE/SWITCH OPTIONS:
                        （切り替え前の履歴はリモートに送られないため、要約で文脈を残す。
                          reconnect でも使える。入力欄は空にしておくこと）
   --limit <N>          起動する復元候補の上限（既定: $MAX_SESSIONS。0 で無制限）
+  --pick               復元候補を番号付き一覧から対話選択する
+  --wave-size <N>      N 件ずつ起動して RC 登録確認後に次の波へ進む
+                       （既定: $WAVE_SIZE。0 で従来どおり一括起動）
   --resume-mode <mode> Resume ダイアログの選択（as-is または summary。既定: as-is）
   --yes                メモリ予算の確認プロンプトを省略する
+                       波ごとの RC 未登録確認も自動続行する
   --dry-run            実際には起動せず、何が行われるかだけ表示
                        （switch では manifest の上書きも logout / login も行わない）
 
@@ -1706,8 +1975,12 @@ RECOVER OPTIONS:
   --within <hours>     この時間内に更新された会話ログを対象にする（既定: $RECOVER_HOURS）
   --auto-confirm       起動後の確認ダイアログ（trust / Resume from summary）に Enter を自動送信
   --limit <N>          起動する復元候補の上限（既定: $MAX_SESSIONS。0 で無制限）
+  --pick               復元候補を番号付き一覧から対話選択する
+  --wave-size <N>      N 件ずつ起動して RC 登録確認後に次の波へ進む
+                       （既定: $WAVE_SIZE。0 で従来どおり一括起動）
   --resume-mode <mode> Resume ダイアログの選択（as-is または summary。既定: as-is）
   --yes                メモリ予算の確認プロンプトを省略する
+                       波ごとの RC 未登録確認も自動続行する
   --no-rename          復帰セッションに名前を付けない
   --dry-run            候補一覧だけ表示して起動しない
 
@@ -1729,6 +2002,7 @@ ENVIRONMENT:
   CLAUDE_RC_RECOVER_HOURS  recover の既定の対象時間（既定: 6。--within で上書き）
   CLAUDE_RC_CONFIRM_WAIT   recover で確認ダイアログを見に行くまでの待ち秒数（既定: 10）
   CLAUDE_RC_MAX_SESSIONS   restore / recover で起動する復元候補の既定上限（既定: 10。0 で無制限）
+  CLAUDE_RC_WAVE_SIZE      restore / recover で一度に起動する件数（既定: 3。0 で一括起動）
 EOF
 }
 

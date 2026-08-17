@@ -129,8 +129,10 @@ claude-rc-reattach switch
 | `--inherit-bypass` | bypass 系の権限モードも引き継ぐ（既定では引き継がない。後述） |
 | `--recap` | RC 登録できた会話に「経緯を要約して」を 1 通送る（リモート側に文脈を残すため。`reconnect` でも使える） |
 | `--limit <N>` | 起動する復元候補の上限（既定: `CLAUDE_RC_MAX_SESSIONS` / 10。`0` で無制限） |
+| `--pick` | 復元候補を番号付き一覧から対話選択する（非対話環境ではエラー） |
+| `--wave-size <N>` | `N` 件ずつ起動し、各波の RC 登録確認後に次の波へ進む（既定: `CLAUDE_RC_WAVE_SIZE` / 3。`0` で従来どおり一括） |
 | `--resume-mode as-is\|summary` | 「Resume full session as-is」ダイアログの選択（既定: `as-is`） |
-| `--yes` | メモリ予算の確認プロンプトを省略 |
+| `--yes` | メモリ予算と波ごとの RC 未登録確認プロンプトを省略 |
 | `--dry-run` | 実際には起動せず、何が行われるかだけ表示（`switch` では manifest の上書きも logout / login も行いません） |
 
 **終了コード（restore / switch）**:
@@ -173,6 +175,12 @@ $ claude-rc-reattach restore
 restore / recover は会話ログ（`*.jsonl`）の最終更新が新しい順に候補を並べ、既定では先頭 10 件だけ起動します。
 上限は `--limit <N>` または `CLAUDE_RC_MAX_SESSIONS` で変更できます（`--limit 0` は無制限）。
 上限を超えた候補がある場合は、未復元の件数と名前を表示し、追加で起動したいときの `claude-rc-reattach restore --limit ...` を案内します。
+
+**復元候補を選んで起動できます**:
+restore / recover に `--pick` を付けると、復元候補を「番号 / 最終更新 / 名前 / フォルダ」の一覧で表示し、`1,3,5` のようなカンマ区切りで起動対象を選べます。
+`a` は全部、`q` は中止です。
+`--limit` と併用した場合は、一覧自体が上限件数に絞られます。
+標準入力が tty ではない非対話環境では `--pick` はエラーになります。
 
 **起動前にメモリ予算を確認します**:
 restore / recover は起動予定件数を 1 件あたり 600MB とみなし、macOS の `vm_stat` から free + inactive ページを空きメモリとして概算します。
@@ -226,7 +234,10 @@ reconnect の対象は、tmux セッション（既定: `rc-restore`）内で **
 既に復帰済みで tmux ウィンドウが生きている会話は skip します。
 RC だけが切れている場合は `reconnect` を使ってください。
 
-restore はセッションの同時起動による credential の同時発行・同時失効を緩和するため、各ウィンドウの起動間隔を既定で 3 秒空けます（`CLAUDE_RC_STAGGER_SECS` で変更、`0` で無効化）。
+restore / recover はセッションの同時起動による credential の同時発行・同時失効を緩和するため、既定で 3 件ずつ起動し、各波ごとに RC 登録を確認してから次へ進みます。
+1 つの波で登録確認がタイムアウトした場合は「◯件がRC未登録のまま。続行しますか(y/N)」と確認します（`--yes` で自動続行）。
+波のサイズは `--wave-size <N>` または `CLAUDE_RC_WAVE_SIZE` で変更でき、`--wave-size 0` なら従来どおり全候補を一括起動して最後にまとめて確認します。
+各ウィンドウの起動間隔は引き続き既定で 3 秒空けます（`CLAUDE_RC_STAGGER_SECS` で変更、`0` で無効化）。
 
 ### リモート側に切り替え前の履歴は表示されない
 
