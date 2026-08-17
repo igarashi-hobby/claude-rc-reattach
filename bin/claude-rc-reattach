@@ -26,7 +26,10 @@ VERIFY_TIMEOUT="${CLAUDE_RC_VERIFY_TIMEOUT:-60}"
 STAGGER_SECS="${CLAUDE_RC_STAGGER_SECS:-3}"
 RECOVER_HOURS="${CLAUDE_RC_RECOVER_HOURS:-6}"
 CONFIRM_WAIT="${CLAUDE_RC_CONFIRM_WAIT:-10}"
+MAX_SESSIONS="${CLAUDE_RC_MAX_SESSIONS:-10}"
 CONFIRM_PENDING=0   # handle_confirm_dialogs の結果（ダイアログ待ちの pane 数）
+RESUME_MODE="as-is"
+CONFIRM_DIALOG_ENTRIES=()
 # --recap で送るプロンプト。復帰後の RC セッションには切り替え前の履歴が送られない
 # （Claude Code のクロスアカウント抑止）ため、要約を 1 通送って文脈をリモートに残す。
 # 送信後すぐ Enter を打つので、必ず 1 行で書くこと
@@ -58,6 +61,10 @@ fi
 if [[ ! "$CONFIRM_WAIT" =~ ^[0-9]+$ ]]; then
   warn "CLAUDE_RC_CONFIRM_WAIT='$CONFIRM_WAIT' は数値ではないため既定値 10 を使います"
   CONFIRM_WAIT=10
+fi
+if [[ ! "$MAX_SESSIONS" =~ ^[0-9]+$ ]]; then
+  warn "CLAUDE_RC_MAX_SESSIONS='$MAX_SESSIONS' は数値ではないため既定値 10 を使います"
+  MAX_SESSIONS=10
 fi
 
 # tmux はセッション名の . と : を _ に置き換えて保存するため、そのままだと
@@ -327,6 +334,9 @@ wait_rc_registration() {
     done
     (( all_done )) && break
     (( $(date +%s) >= deadline )) && break
+    if (( ${#CONFIRM_DIALOG_ENTRIES[@]} > 0 )); then
+      handle_confirm_dialogs 1 "$RESUME_MODE" "${CONFIRM_DIALOG_ENTRIES[@]}"
+    fi
     sleep 2
   done
   for pane in "${panes[@]}"; do
@@ -491,6 +501,61 @@ print(int(epoch))
 PY
 }
 
+# 会話ログの最初のユーザー発言から表示名に使える短い文字列を作る
+transcript_first_user_title() {
+  python3 - "$1" <<'PY'
+import json, re, sys
+try:
+    with open(sys.argv[1], "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            try:
+                d = json.loads(line)
+            except Exception:
+                continue
+            if d.get("type") != "user" or d.get("isSidechain"):
+                continue
+            c = d.get("message", {}).get("content")
+            if isinstance(c, list):
+                c = " ".join(p.get("text", "") for p in c if isinstance(p, dict))
+            if not isinstance(c, str):
+                continue
+            c = re.sub(r"[\r\n\t]+", " ", c)
+            c = re.sub(r"[^\w\s一-龯ぁ-んァ-ヶー]", "", c, flags=re.UNICODE)
+            c = re.sub(r"\s+", " ", c).strip()
+            if c:
+                print(c[:30])
+                sys.exit(0)
+except OSError:
+    pass
+sys.exit(1)
+PY
+}
+
+# 空名 / UUID 風 / Claude 自動名なら、会話本文や cwd から復元名を作る
+fallback_session_base_name() {
+  local name="$1" transcript="$2" cwd="$3"
+  local base="$name" needs_fallback=0 first cwd_base
+  [[ "$base" == *-restored-* ]] && base="${base%%-restored-*}"
+  if [[ -z "$base" ]]; then
+    needs_fallback=1
+  elif [[ "$base" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+    needs_fallback=1
+  elif [[ "$base" =~ ^[A-Za-z0-9-]+-[0-9]{4}-[0-9]{4}$ ]]; then
+    needs_fallback=1
+  fi
+  if (( needs_fallback )); then
+    first=$(transcript_first_user_title "$transcript" 2>/dev/null) || first=""
+    if [[ -n "$first" ]]; then
+      base="$first"
+    else
+      cwd_base=$(basename "$cwd" 2>/dev/null) || cwd_base=""
+      base="${cwd_base:-restored-session}"
+    fi
+  fi
+  eval 'base="${base[1,30]}"'
+  print -r -- "$base"
+}
+
 # 実行中プロセスの起動引数から権限モード関連のフラグだけを抜き出す
 #   権限モードは会話ではなくプロセス起動時の状態のため ~/.claude/sessions/*.json には残らない。
 #   save の時点なら元プロセスが生きているので、コマンドラインから拾える。
@@ -545,8 +610,53 @@ claude_supports_name() {
 #   例: あすまるくん改修-immutable-cre-restored-0815
 restored_session_name() {
   local prefix
-  eval 'prefix="${1[1,20]}"'
+  prefix=$(fallback_session_base_name "$1" "${2:-}" "${3:-}")
   print -r -- "${prefix}-restored-$(date '+%m%d')"
+}
+
+# vm_stat の free + inactive から空きメモリを概算し、600MB/件の起動予算を確認する
+available_memory_mb() {
+  command -v vm_stat >/dev/null 2>&1 || return 1
+  local page_size
+  page_size=$(pagesize 2>/dev/null) || page_size=4096
+  vm_stat | awk -v page="$page_size" '
+    /Pages free:/ { gsub("[^0-9]", "", $3); free=$3 }
+    /Pages inactive:/ { gsub("[^0-9]", "", $3); inactive=$3 }
+    END {
+      mb = int(((free + inactive) * page) / 1024 / 1024)
+      if (mb > 0) print mb
+    }'
+}
+
+confirm_memory_budget() {
+  local count="$1" yes="$2"
+  (( count > 0 )) || return 0
+  local free_mb budget_mb threshold_mb recommended free_gb budget_gb ans
+  free_mb=$(available_memory_mb) || return 0
+  [[ "$free_mb" =~ ^[0-9]+$ ]] || return 0
+  (( budget_mb = count * 600 ))
+  (( threshold_mb = free_mb * 70 / 100 ))
+  (( budget_mb <= threshold_mb )) && return 0
+  (( recommended = threshold_mb / 600 ))
+  (( recommended < 1 )) && recommended=1
+  budget_gb=$(awk -v mb="$budget_mb" 'BEGIN { printf "%.1f", mb / 1024 }')
+  free_gb=$(awk -v mb="$free_mb" 'BEGIN { printf "%.1f", mb / 1024 }')
+  warn "${count}件×600MB=${budget_gb}GB は空き${free_gb}GBに対して過大。--limit ${recommended} を推奨"
+  (( yes )) && return 0
+  printf "続行しますか? [y/N]: "
+  read -r ans || ans=""
+  [[ "$ans" == [yY]* ]]
+}
+
+report_limit_remainder() {
+  local skipped_rows="$1"
+  local count
+  count=$(print -r -- "$skipped_rows" | sed '/^$/d' | wc -l | tr -d ' ')
+  (( count > 0 )) || return 0
+  warn "あと${count}件は復元していません。claude-rc-reattach restore --limit で追加できます"
+  print -r -- "$skipped_rows" | while IFS=$'\t' read -r _epoch label _rest; do
+    [[ -n "$label" ]] && info "• $label"
+  done
 }
 
 # tmux セッション "$TMUX_SESSION" に窓を作って claude を起動し、"pane_id<TAB>pane_pid" を返す
@@ -656,35 +766,75 @@ for path in glob.glob(os.path.join(projects_dir, "*", "*.jsonl")):
         continue
     rows.append((os.path.basename(os.path.dirname(path)), -mtime, sid, cwd, title))
 
-for proj, negmtime, sid, cwd, title in sorted(rows):
+for proj, negmtime, sid, cwd, title in sorted(rows, key=lambda x: x[1]):
     when = datetime.fromtimestamp(-negmtime).strftime("%Y-%m-%d %H:%M")
     print("\t".join([when, sid, cwd, proj, title]))
 PY
 }
 
-# 起動直後の確認ダイアログ（trust 確認 / Resume from summary）を検出する
-#   auto=1 なら Enter を送って進める（連続する最大 3 段まで）。auto=0 なら検出のみ。
+# 起動直後の確認ダイアログ（trust 確認 / Resume full session as-is 等）を検出する
+#   auto=1 なら trust 確認にも Enter を送って進める（連続する最大 3 段まで）。
+#   resume-mode は選択肢番号を capture から拾って送る。
 #   結果（ダイアログ待ちのまま残った pane の数）は CONFIRM_PENDING に入れる
 #   （進捗表示を出すため、標準出力では返さない）
 handle_confirm_dialogs() {
-  local auto="$1"; shift
+  local auto="$1" resume_mode="${2:-as-is}"; shift 2
   local -a entries
   entries=("$@")
-  local e pane_id label out step pending=0
+  local e pane_id label out step pending=0 choice
   for e in "${entries[@]}"; do
     pane_id="${e%%$'\t'*}"
     label="${e#*$'\t'}"
     # 4 周目は「3 回送っても消えないダイアログ」を待ち扱いにするための確認だけ
     for step in 1 2 3 4; do
       out=$(tmux capture-pane -p -t "$pane_id" 2>/dev/null) || break
-      [[ "$out" != *"Enter to confirm"* ]] && break
-      if (( ! auto || step > 3 )); then
+      if [[ "$out" == *"Resume full session as-is"* ]]; then
+        choice=$(CHOICE_TEXT="$out" python3 - "$resume_mode" <<'PY'
+import os, re, sys
+mode = sys.argv[1]
+text = os.environ.get("CHOICE_TEXT", "")
+choices = re.findall(r"(?m)^\s*([0-9]+)\.\s*(.+?)\s*$", text)
+if mode == "as-is":
+    for n, label in choices:
+        if "Resume full session as-is" in label:
+            print(n)
+            break
+else:
+    for n, label in choices:
+        if "Resume full session as-is" not in label:
+            print(n)
+            break
+PY
+)
+        if [[ -n "$choice" && "$step" -le 3 ]]; then
+          tmux send-keys -t "$pane_id" "$choice"
+          sleep 0.2
+          tmux send-keys -t "$pane_id" Enter
+          info "$label: resume-mode=$resume_mode の選択肢 $choice を送信しました"
+          sleep 2
+          continue
+        fi
         (( pending++ )) || true
         break
+      elif [[ "$out" == *"Yes, I trust"* ]]; then
+        if (( step > 3 )); then
+          (( pending++ )) || true
+          break
+        fi
+        tmux send-keys -t "$pane_id" Enter
+        info "$label: trust 確認に Enter を送信しました（${step} 段目）"
+        sleep 2
+      elif [[ "$out" == *"Enter to confirm"* ]]; then
+        if (( ! auto || step > 3 )); then
+          (( pending++ )) || true
+          break
+        fi
+        tmux send-keys -t "$pane_id" Enter
+        info "$label: 確認ダイアログに Enter を送信しました（${step} 段目）"
+        sleep 2
+      else
+        break
       fi
-      tmux send-keys -t "$pane_id" Enter
-      info "$label: 確認ダイアログに Enter を送信しました（${step} 段目）"
-      sleep 2
     done
   done
   CONFIRM_PENDING=$pending
@@ -764,17 +914,43 @@ cmd_save() {
 }
 
 cmd_restore() {
-  local fork=1 dry=0 inherit_perms=1 force=0 rename=1 recap=0 inherit_bypass=0
+  local fork=1 dry=0 inherit_perms=1 force=0 rename=1 recap=0 inherit_bypass=0 yes=0 limit="$MAX_SESSIONS"
+  RESUME_MODE="as-is"
   while (( $# )); do
     case "$1" in
       --fork)    fork=1 ;;
       --no-fork) fork=0 ;;
       --dry-run) dry=1 ;;
+      --yes)     yes=1 ;;
       --force)   force=1 ;;
       --no-rename) rename=0 ;;
       --no-inherit-perms) inherit_perms=0 ;;
       --inherit-bypass)   inherit_bypass=1 ;;
       --recap)   recap=1 ;;
+      --limit)
+        shift
+        if [[ ! "${1:-}" =~ ^[0-9]+$ ]]; then
+          err "--limit には件数（数値）を指定してください"
+          return 1
+        fi
+        limit="$1" ;;
+      --limit=*)
+        limit="${1#--limit=}"
+        if [[ ! "$limit" =~ ^[0-9]+$ ]]; then
+          err "--limit には件数（数値）を指定してください"
+          return 1
+        fi ;;
+      --resume-mode)
+        shift
+        case "${1:-}" in
+          as-is|summary) RESUME_MODE="$1" ;;
+          *) err "--resume-mode は as-is または summary を指定してください"; return 1 ;;
+        esac ;;
+      --resume-mode=*)
+        case "${1#--resume-mode=}" in
+          as-is|summary) RESUME_MODE="${1#--resume-mode=}" ;;
+          *) err "--resume-mode は as-is または summary を指定してください"; return 1 ;;
+        esac ;;
       *) err "不明なオプション: $1"; return 1 ;;
     esac
     shift
@@ -849,16 +1025,46 @@ cmd_restore() {
   restored_ids=$(tmux list-panes -s -t "=$TMUX_SESSION" -F '#{pane_dead} #{@rc_sid}' 2>/dev/null \
     | while read -r _dead _sid; do [[ "$_dead" == 0 && -n "$_sid" ]] && print -r -- "$_sid"; done)
 
+  local manifest_rows sorted_rows limited_rows remainder_rows planned_count
+  manifest_rows=$(while IFS= read -r line; do
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    eval 'f=("${(@ps:\t:)line}")'
+    sid="${f[1]:-}"; cwd="${f[2]:-}"; name="${f[3]:-}"
+    [[ -z "$sid" ]] && continue
+    label="${name:-$sid}"
+    if transcript=$(find_transcript "$cwd" "$sid" 2>/dev/null); then
+      last_epoch=$(transcript_last_epoch "$transcript")
+    else
+      last_epoch=0
+    fi
+    printf '%s\t%s\t%s\n' "$last_epoch" "$label" "$line"
+  done < "$MANIFEST" | sort -rn -t $'\t' -k1,1)
+  if (( limit > 0 )); then
+    limited_rows=$(print -r -- "$manifest_rows" | awk -F '\t' -v limit="$limit" 'NR <= limit')
+    remainder_rows=$(print -r -- "$manifest_rows" | awk -F '\t' -v limit="$limit" 'NR > limit')
+  else
+    limited_rows="$manifest_rows"
+    remainder_rows=""
+  fi
+  planned_count=$(print -r -- "$limited_rows" | sed '/^$/d' | wc -l | tr -d ' ')
+  if (( ! dry )); then
+    confirm_memory_budget "$planned_count" "$yes" || {
+      err "メモリ予算チェックで中断しました"
+      return 1
+    }
+  fi
+
   local resumed=0 skipped=0 now
   now=$(date +%s)
-  local sid cwd name opid perm label transcript win cmd_str last_epoch age_days pane_info pane_id pane_pid line
-  local -a claude_cmd perm_args v_entries f
+  local sid cwd name opid perm label restored_name rc_name transcript win cmd_str last_epoch age_days pane_info pane_id pane_pid line sort_epoch sort_label
+  local -a claude_cmd perm_args v_entries d_entries f
   # 同じ会話を 2 回起動すると 1 本の会話ログに両方が書き込まれるため、実行内でも重複を弾く
   # （古いバージョンが書いた manifest や手で編集した manifest に重複が残っていることがある）
   typeset -A seen_sids
   v_entries=()
-  while IFS= read -r line; do
-    [[ -z "$line" || "$line" == \#* ]] && continue
+  d_entries=()
+  while IFS=$'\t' read -r sort_epoch sort_label line; do
+    [[ -z "$line" ]] && continue
     # IFS=$'\t' read は連続タブを畳んで列をずらすため使わない（無名セッション対策）
     eval 'f=("${(@ps:\t:)line}")'
     sid="${f[1]:-}"; cwd="${f[2]:-}"; name="${f[3]:-}"; opid="${f[4]:-}"; perm="${f[5]:-}"
@@ -939,8 +1145,10 @@ cmd_restore() {
       (( ${#perm_args} )) && info "$label: 権限モードを引き継ぎます（${perm_args[*]}）"
     fi
 
+    restored_name=""
+    (( rename )) && restored_name=$(restored_session_name "$label" "$transcript" "$cwd")
     claude_cmd=(claude --resume "$sid" "${perm_args[@]}" "${claude_extra[@]}")
-    (( name_ok )) && claude_cmd+=(-n "$(restored_session_name "$label")")
+    (( name_ok && rename )) && claude_cmd+=(-n "$restored_name")
     if print -r -- "$open_ids" | grep -Fqx -- "$sid"; then
       if (( fork )); then
         claude_cmd+=(--fork-session)
@@ -954,8 +1162,9 @@ cmd_restore() {
     # --remote-control は値を省略できる形式のため、後続の引数を名前と誤解されないよう最後に置く。
     # 会話名があれば claude.ai/code のセッション名として渡す（- で始まる名前は値として渡さない）
     if (( rc_flag )); then
-      if [[ -n "$name" && "$name" != -* ]]; then
-        claude_cmd+=(--remote-control "$name")
+      rc_name="${restored_name:-$name}"
+      if [[ -n "$rc_name" && "$rc_name" != -* ]]; then
+        claude_cmd+=(--remote-control "$rc_name")
       else
         claude_cmd+=(--remote-control)
       fi
@@ -984,9 +1193,10 @@ cmd_restore() {
     pane_id="${pane_info%%$'\t'*}"
     pane_pid="${pane_info#*$'\t'}"
     v_entries+=("${pane_pid}"$'\t'"$label")
+    d_entries+=("${pane_id}"$'\t'"$label")
     ok "$label: 起動しました（tmux window: $win）"
     (( resumed++ )) || true
-  done < "$MANIFEST"
+  done <<< "$limited_rows"
 
   print
   ok "完了: 起動 $resumed 件 / skip $skipped 件"
@@ -998,15 +1208,20 @@ cmd_restore() {
     if (( skipped == 0 )); then
       warn "manifest に復帰対象の会話がありません（save は実行済みですか）"
     fi
+    report_limit_remainder "$remainder_rows"
     return 1
   fi
-  (( dry )) && return $rc
+  if (( dry )); then
+    report_limit_remainder "$remainder_rows"
+    return $rc
+  fi
 
   # 起動成功 ≠ RC 登録成功。RC 登録は resume 後に非同期で行われ、credential の問題で
   # 失敗・切断されることがあるため、状態ファイルの bridgeSessionId で実測確認する
   if (( VERIFY_TIMEOUT > 0 )); then
     print
     print -- "── RC 登録の確認（最大 ${VERIFY_TIMEOUT} 秒待機） ──"
+    CONFIRM_DIALOG_ENTRIES=("${d_entries[@]}")
     if wait_rc_registration "$VERIFY_TIMEOUT" "${v_entries[@]}"; then
       print
       ok "すべての会話の RC 登録を確認しました"
@@ -1018,6 +1233,7 @@ cmd_restore() {
       info "（または tmux attach -t $TMUX_SESSION で該当ウィンドウを開き、手動で /remote-control を実行）"
       rc=1
     fi
+    CONFIRM_DIALOG_ENTRIES=()
   else
     print
     info "確認方法:"
@@ -1035,13 +1251,15 @@ cmd_restore() {
     info "  経緯をリモートにも残したい場合は --recap を付けて実行するか、"
     info "  復帰した各セッションで「これまでの経緯を要約して」と 1 通送ってください"
   fi
+  report_limit_remainder "$remainder_rows"
   return $rc
 }
 
 # manifest 無しで復旧するモード（save する前にクラッシュ／強制終了した場合の受け皿）
 #   ~/.claude/projects/ の会話ログから「直近に更新された & いま動いていない」ものを拾って resume する
 cmd_recover() {
-  local dry=0 auto_confirm=0 rename=1 hours="$RECOVER_HOURS"
+  local dry=0 auto_confirm=0 rename=1 hours="$RECOVER_HOURS" yes=0 limit="$MAX_SESSIONS"
+  RESUME_MODE="as-is"
   while (( $# )); do
     case "$1" in
       --within)
@@ -1052,8 +1270,33 @@ cmd_recover() {
         fi
         hours="$1" ;;
       --dry-run)      dry=1 ;;
+      --yes)          yes=1 ;;
       --auto-confirm) auto_confirm=1 ;;
       --no-rename)    rename=0 ;;
+      --limit)
+        shift
+        if [[ ! "${1:-}" =~ ^[0-9]+$ ]]; then
+          err "--limit には件数（数値）を指定してください"
+          return 1
+        fi
+        limit="$1" ;;
+      --limit=*)
+        limit="${1#--limit=}"
+        if [[ ! "$limit" =~ ^[0-9]+$ ]]; then
+          err "--limit には件数（数値）を指定してください"
+          return 1
+        fi ;;
+      --resume-mode)
+        shift
+        case "${1:-}" in
+          as-is|summary) RESUME_MODE="$1" ;;
+          *) err "--resume-mode は as-is または summary を指定してください"; return 1 ;;
+        esac ;;
+      --resume-mode=*)
+        case "${1#--resume-mode=}" in
+          as-is|summary) RESUME_MODE="${1#--resume-mode=}" ;;
+          *) err "--resume-mode は as-is または summary を指定してください"; return 1 ;;
+        esac ;;
       *) err "不明なオプション: $1"; return 1 ;;
     esac
     shift
@@ -1070,6 +1313,22 @@ cmd_recover() {
     info "直近 ${hours} 時間以内に更新された、いま動いていない会話はありません"
     return 0
   fi
+  local indexed_rows limited_rows remainder_rows planned_count
+  indexed_rows=$(print -r -- "$rows" | awk -F '\t' '{ label = ($5 != "" ? $5 : $2); print NR "\t" label "\t" $0 }')
+  if (( limit > 0 )); then
+    limited_rows=$(print -r -- "$indexed_rows" | awk -F '\t' -v limit="$limit" 'BEGIN { OFS = FS } NR <= limit { print $3, $4, $5, $6, $7 }')
+    remainder_rows=$(print -r -- "$indexed_rows" | awk -F '\t' -v limit="$limit" 'NR > limit')
+  else
+    limited_rows="$rows"
+    remainder_rows=""
+  fi
+  planned_count=$(print -r -- "$limited_rows" | sed '/^$/d' | wc -l | tr -d ' ')
+  if (( ! dry )); then
+    confirm_memory_budget "$planned_count" "$yes" || {
+      err "メモリ予算チェックで中断しました"
+      return 1
+    }
+  fi
 
   # 復帰セッションに名前を付けられるか（claude のバージョンによっては -n が無い）
   local name_ok=0
@@ -1084,7 +1343,7 @@ cmd_recover() {
   print -- "復旧候補（直近 ${hours} 時間・実行中のものを除く）:"
   # 注意: zsh ではループ内で `local` を再宣言すると変数の中身が出力されるため、
   # ループで使う変数はここでまとめて宣言する
-  local when sid cwd proj title label win cmd_str pane_info pane_id pane_pid last_proj=""
+  local when sid cwd proj title label win cmd_str pane_info pane_id pane_pid last_proj="" transcript
   local recovered=0 skipped=0
   local -a claude_cmd v_entries d_entries
   v_entries=()
@@ -1105,8 +1364,9 @@ cmd_recover() {
       continue
     fi
 
+    transcript=$(find_transcript "$cwd" "$sid" 2>/dev/null) || transcript=""
     claude_cmd=(claude --resume "$sid")
-    (( name_ok )) && claude_cmd+=(-n "$(restored_session_name "$label")")
+    (( name_ok )) && claude_cmd+=(-n "$(restored_session_name "$label" "$transcript" "$cwd")")
 
     win="${label//[^A-Za-z0-9_.-]/-}"
     eval 'win="${win[1,30]}"'
@@ -1134,30 +1394,36 @@ cmd_recover() {
     d_entries+=("${pane_id}"$'\t'"$label")
     ok "$label: 起動しました（tmux window: $win）"
     (( recovered++ )) || true
-  done <<< "$rows"
+  done <<< "$limited_rows"
 
   print
   if (( dry )); then
     ok "候補 $recovered 件 / skip $skipped 件（--dry-run のため起動していません）"
+    report_limit_remainder "$remainder_rows"
     return 0
   fi
   ok "完了: 起動 $recovered 件 / skip $skipped 件"
-  (( recovered > 0 )) || return 0
+  if (( recovered == 0 )); then
+    report_limit_remainder "$remainder_rows"
+    return 0
+  fi
 
   # restore と違い trust ダイアログや「Resume from summary」で止まることがある
   # （manifest 経由でないぶん、最後に開いた状態が読めないため）
   sleep "$CONFIRM_WAIT"
-  handle_confirm_dialogs "$auto_confirm" "${d_entries[@]}"
+  handle_confirm_dialogs "$auto_confirm" "$RESUME_MODE" "${d_entries[@]}"
   if (( CONFIRM_PENDING > 0 )); then
     print
     warn "${CONFIRM_PENDING} 個のセッションが確認ダイアログ待ちです。--auto-confirm で自動応答できます"
     info "（または tmux attach -t $TMUX_SESSION でウィンドウを開き、手動で Enter）"
+    report_limit_remainder "$remainder_rows"
     return 1
   fi
 
   if (( VERIFY_TIMEOUT > 0 )); then
     print
     print -- "── RC 登録の確認（最大 ${VERIFY_TIMEOUT} 秒待機） ──"
+    CONFIRM_DIALOG_ENTRIES=("${d_entries[@]}")
     if wait_rc_registration "$VERIFY_TIMEOUT" "${v_entries[@]}"; then
       print
       ok "すべての会話の RC 登録を確認しました"
@@ -1166,12 +1432,17 @@ cmd_recover() {
       print
       warn "RC 未登録の会話があります。以下で再接続を試してください:"
       info "claude-rc-reattach reconnect"
+      CONFIRM_DIALOG_ENTRIES=()
+      report_limit_remainder "$remainder_rows"
       return 1
     fi
+    CONFIRM_DIALOG_ENTRIES=()
+    report_limit_remainder "$remainder_rows"
   else
     print
     info "確認方法:"
     info "  tmux attach -t $TMUX_SESSION     # 各ウィンドウのフッターに /rc active が出ていれば成功"
+    report_limit_remainder "$remainder_rows"
   fi
 }
 
@@ -1288,7 +1559,13 @@ cmd_switch() {
   while (( $# )); do
     case "$1" in
       --dry-run) dry=1; pass_opts+=("$1") ;;
-      --fork|--no-fork|--force|--no-rename|--no-inherit-perms|--inherit-bypass|--recap) pass_opts+=("$1") ;;
+      --fork|--no-fork|--force|--no-rename|--no-inherit-perms|--inherit-bypass|--recap|--yes) pass_opts+=("$1") ;;
+      --limit|--resume-mode)
+        pass_opts+=("$1")
+        shift
+        [[ -n "${1:-}" ]] || { err "${pass_opts[-1]} には値が必要です"; return 1; }
+        pass_opts+=("$1") ;;
+      --limit=*|--resume-mode=*) pass_opts+=("$1") ;;
       *) err "不明なオプション: $1"; return 1 ;;
     esac
     shift
@@ -1414,6 +1691,9 @@ RESTORE/SWITCH OPTIONS:
   --recap              RC 登録できた会話に「経緯を要約して」を 1 通送る
                        （切り替え前の履歴はリモートに送られないため、要約で文脈を残す。
                          reconnect でも使える。入力欄は空にしておくこと）
+  --limit <N>          起動する復元候補の上限（既定: $MAX_SESSIONS。0 で無制限）
+  --resume-mode <mode> Resume ダイアログの選択（as-is または summary。既定: as-is）
+  --yes                メモリ予算の確認プロンプトを省略する
   --dry-run            実際には起動せず、何が行われるかだけ表示
                        （switch では manifest の上書きも logout / login も行わない）
 
@@ -1425,6 +1705,9 @@ EXIT STATUS (restore / switch):
 RECOVER OPTIONS:
   --within <hours>     この時間内に更新された会話ログを対象にする（既定: $RECOVER_HOURS）
   --auto-confirm       起動後の確認ダイアログ（trust / Resume from summary）に Enter を自動送信
+  --limit <N>          起動する復元候補の上限（既定: $MAX_SESSIONS。0 で無制限）
+  --resume-mode <mode> Resume ダイアログの選択（as-is または summary。既定: as-is）
+  --yes                メモリ予算の確認プロンプトを省略する
   --no-rename          復帰セッションに名前を付けない
   --dry-run            候補一覧だけ表示して起動しない
 
@@ -1445,6 +1728,7 @@ ENVIRONMENT:
                              5 行以内で要約してください。）
   CLAUDE_RC_RECOVER_HOURS  recover の既定の対象時間（既定: 6。--within で上書き）
   CLAUDE_RC_CONFIRM_WAIT   recover で確認ダイアログを見に行くまでの待ち秒数（既定: 10）
+  CLAUDE_RC_MAX_SESSIONS   restore / recover で起動する復元候補の既定上限（既定: 10。0 で無制限）
 EOF
 }
 

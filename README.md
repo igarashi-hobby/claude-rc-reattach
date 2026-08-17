@@ -128,6 +128,9 @@ claude-rc-reattach switch
 | `--no-inherit-perms` | save 時に検出した権限モードを引き継がない |
 | `--inherit-bypass` | bypass 系の権限モードも引き継ぐ（既定では引き継がない。後述） |
 | `--recap` | RC 登録できた会話に「経緯を要約して」を 1 通送る（リモート側に文脈を残すため。`reconnect` でも使える） |
+| `--limit <N>` | 起動する復元候補の上限（既定: `CLAUDE_RC_MAX_SESSIONS` / 10。`0` で無制限） |
+| `--resume-mode as-is\|summary` | 「Resume full session as-is」ダイアログの選択（既定: `as-is`） |
+| `--yes` | メモリ予算の確認プロンプトを省略 |
 | `--dry-run` | 実際には起動せず、何が行われるかだけ表示（`switch` では manifest の上書きも logout / login も行いません） |
 
 **終了コード（restore / switch）**:
@@ -159,9 +162,27 @@ $ claude-rc-reattach restore
 複製も作りたくない場合は `--force --no-fork` で該当の会話を skip します。
 
 **復帰セッションには名前が付きます（既定）**:
-復帰した会話は `claude -n "<元の名前の先頭 20 文字>-restored-MMDD"` で起動するため、claude.ai/code の一覧で元の会話と区別できます（例: `あすまるくん改修-immutable-c-restored-0815`）。
+復帰した会話は `claude -n "<復元名の先頭 30 文字>-restored-MMDD"` で起動するため、claude.ai/code の一覧で元の会話と区別できます（例: `あすまるくん改修-immutable-cre-restored-0815`）。
+元の名前が空、UUID 形式、または Claude の自動名（英数字とハイフンのみで `-MMDD-HHMM` 風の末尾）に見える場合は、会話ログの最初のユーザー発言の先頭 30 文字（改行・記号を除去）を使います。
+それも取れない場合は cwd のディレクトリ名にフォールバックします。
+既存名に `-restored-` が含まれる場合は、最初の `-restored-` 以降を落としてから当日の `-restored-MMDD` を付け直すため、復帰を重ねても名前が積み上がりません。
 `-n` に未対応の古い claude では、その旨を表示して名前なしで起動します。
 名前を付けたくない場合は `--no-rename` を付けてください。
+
+**復元候補は新しい順に上限付きで起動します**:
+restore / recover は会話ログ（`*.jsonl`）の最終更新が新しい順に候補を並べ、既定では先頭 10 件だけ起動します。
+上限は `--limit <N>` または `CLAUDE_RC_MAX_SESSIONS` で変更できます（`--limit 0` は無制限）。
+上限を超えた候補がある場合は、未復元の件数と名前を表示し、追加で起動したいときの `claude-rc-reattach restore --limit ...` を案内します。
+
+**起動前にメモリ予算を確認します**:
+restore / recover は起動予定件数を 1 件あたり 600MB とみなし、macOS の `vm_stat` から free + inactive ページを空きメモリとして概算します。
+予算が空きメモリの 70% を超える場合は、推奨 `--limit` を表示して `y/N` 確認で止めます。
+問題ないと分かっている場合は `--yes` で確認を省略できます。
+
+**Resume ダイアログの選択を指定できます**:
+起動後の pane に `Resume full session as-is` を含むダイアログが出た場合、`--resume-mode as-is` ではその選択肢の番号を、`--resume-mode summary` では as-is ではない最初の番号選択肢を送って Enter します。
+trust 確認（`Yes, I trust`）は Enter で承認します。
+restore の RC 登録確認ループ中も 2 秒ごとにこのダイアログ処理を行います。
 
 **RC は起動時に明示します**:
 restore は `claude --resume <sessionId> --remote-control <会話名>` で起動します。
@@ -276,6 +297,9 @@ $ claude-rc-reattach recover --dry-run
 |---|---|
 | `--within <hours>` | 対象とする時間（既定: 6） |
 | `--auto-confirm` | 起動後の確認ダイアログに Enter を自動送信 |
+| `--limit <N>` | 起動する復元候補の上限（既定: `CLAUDE_RC_MAX_SESSIONS` / 10。`0` で無制限） |
+| `--resume-mode as-is\|summary` | 「Resume full session as-is」ダイアログの選択（既定: `as-is`） |
+| `--yes` | メモリ予算の確認プロンプトを省略 |
 | `--no-rename` | 復帰セッションに名前を付けない |
 | `--dry-run` | 候補一覧だけ表示して起動しない |
 
@@ -362,6 +386,7 @@ CLAUDE_RC_CLAUDE_ARGS="--dangerously-skip-permissions --append-system-prompt '�
 | `CLAUDE_RC_RECAP_PROMPT` | `これまでの会話の経緯と、いま取り組んでいることを 5 行以内で要約してください。` | `--recap` で送るプロンプト（必ず 1 行で書くこと） |
 | `CLAUDE_RC_RECOVER_HOURS` | `6` | recover が対象とする時間（`--within` を付けた場合はそちらが優先） |
 | `CLAUDE_RC_CONFIRM_WAIT` | `10` | recover で確認ダイアログを見に行くまでの待ち秒数 |
+| `CLAUDE_RC_MAX_SESSIONS` | `10` | restore / recover で起動する復元候補の既定上限（`0` = 無制限） |
 
 ## 仕組み
 
