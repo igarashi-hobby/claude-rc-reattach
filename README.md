@@ -96,7 +96,7 @@ restore は `claude --resume <sessionId> --remote-control <会話名>` の形で
 | コマンド | 実行タイミング | 動作 |
 |---|---|---|
 | `list` | いつでも | RC 接続中の会話を一覧表示（save 対象の事前確認用） |
-| `save` | 切り替え**前** | RC 接続中の会話を manifest ファイルに記録 |
+| `save` | 切り替え**前** | RC 接続中の会話を manifest ファイルに記録（一時ファイル → `mv` の原子的置換。ディレクトリ作成・書き込みに失敗した場合は「保存しました」と言わずエラーで終了し、既存の manifest も壊しません。switch はこの失敗で logout に進みません） |
 | `restore` | 切り替え**後**（ログイン済み） | manifest の各会話を tmux 内で resume し、RC 再登録と登録確認まで行う |
 | `switch` | — | save → logout → login → restore を対話形式で一括実行 |
 | `recover` | save し損ねた時 | manifest を使わず、直近に更新された会話ログから復旧候補を探して resume |
@@ -130,7 +130,7 @@ claude-rc-reattach switch
 | `--inherit-bypass` | bypass 系の権限モードも引き継ぐ（既定では引き継がない。後述） |
 | `--recap` | RC 登録できた会話に要約依頼を 1 通送る（既定） |
 | `--no-recap` | 要約依頼を送らない |
-| `--limit <N>` | 起動する復元候補の上限（既定: `CLAUDE_RC_MAX_SESSIONS` / 10。`0` で無制限） |
+| `--limit <N>` | 起動する復元候補の上限（既定: `CLAUDE_RC_MAX_SESSIONS` / 15。`0` で無制限） |
 | `--pick` | 復元候補を番号付き一覧から対話選択する（非対話環境ではエラー） |
 | `--wave-size <N>` | `N` 件ずつ起動し、各波の RC 登録確認後に次の波へ進む（既定: `CLAUDE_RC_WAVE_SIZE` / 3。`0` で従来どおり一括） |
 | `--resume-mode as-is\|summary` | 「Resume full session as-is」ダイアログの選択（既定: `as-is`） |
@@ -167,16 +167,23 @@ $ claude-rc-reattach restore
 
 **復帰セッションには名前が付きます（既定）**:
 復帰した会話は `claude -n "<復元名の先頭 30 文字>-restored-MMDD"` で起動するため、claude.ai/code の一覧で元の会話と区別できます（例: `あすまるくん改修-immutable-cre-restored-0815`）。
-元の名前が空、UUID 形式、または Claude の自動名（英数字とハイフンのみで `-MMDD-HHMM` 風の末尾）に見える場合は、会話ログの最初のユーザー発言の先頭 30 文字（改行・記号を除去）を使います。
+元の名前が空、UUID 形式、または Claude の自動名（英数字とハイフンのみで `-MMDD-HHMM` 風の末尾）に見える場合は、会話ログから名前を作ります。
+会話に付いている名前（`custom-title` / `agent-name`）があればそれを優先し、無ければ最初のユーザー発言の先頭 30 文字（改行・記号を除去）を使います。
+Claude Code がスラッシュコマンド実行時などに先頭へ差し込む `<local-command-caveat>` / `<command-name>` / `<system-reminder>` だけの発言は名前に使わず、次の発言を見ます（素で採用すると `localcommandcaveatCaveat The m-restored-MMDD` のような名前になるため）。
 それも取れない場合は cwd のディレクトリ名にフォールバックします。
 既存名に `-restored-` が含まれる場合は、最初の `-restored-` 以降を落としてから当日の `-restored-MMDD` を付け直すため、復帰を重ねても名前が積み上がりません。
 `-n` に未対応の古い claude では、その旨を表示して名前なしで起動します。
 名前を付けたくない場合は `--no-rename` を付けてください。
+tmux のウィンドウ名は `<sessionId の先頭 8 桁>-<会話名>`（会話名は 20 文字まで）です。
+日本語はそのまま残します（非英数字を一括で `-` に潰すと「ミチガエル経営ダッシュボード」が `--------------` になり、attach しても会話を区別できず、手動 `kill-window` の誤爆や `reconnect` の出力での取り違えを招くため）。
+tmux のターゲット指定で意味を持つ `.` `:` と空白・制御文字だけを `-` に置き換えます。
 
 **復元候補は新しい順に上限付きで起動します**:
-restore / recover は会話ログ（`*.jsonl`）の最終更新が新しい順に候補を並べ、既定では先頭 10 件だけ起動します。
+restore / recover は会話ログ（`*.jsonl`）の最終更新が新しい順に候補を並べ、既定では先頭 15 件だけ起動します。
 上限は `--limit <N>` または `CLAUDE_RC_MAX_SESSIONS` で変更できます（`--limit 0` は無制限）。
 上限を超えた候補がある場合は、未復元の件数と名前を表示し、追加で起動したいときの `claude-rc-reattach restore --limit ...` を案内します。
+上限のカウントは「実際に起動する候補」だけを対象にします（restore は limit を掛ける前に、すでに動いている会話・復帰済みの会話・manifest 内の重複・作業ディレクトリや会話ログが無い行を除外します）。
+実行中の会話は会話ログが最も新しいため先頭に並びます。これを数えてしまうと `--limit` の枠が skip 行で埋まり、案内どおり再実行しても未復元の会話に到達できないためです。
 
 **復元候補を選んで起動できます**:
 restore / recover に `--pick` を付けると、復元候補を「番号 / 最終更新 / 名前 / フォルダ」の一覧で表示し、`1,3,5` のようなカンマ区切りで起動対象を選べます。
@@ -191,11 +198,12 @@ restore / recover は起動予定件数を 1 件あたり 600MB とみなし、m
 
 **Resume ダイアログの選択を指定できます**:
 起動後の pane に `Resume full session as-is` を含むダイアログが出た場合、`--resume-mode as-is` ではその選択肢の番号を、`--resume-mode summary` では as-is ではない最初の番号選択肢を送って Enter します。
-trust 確認（`Yes, I trust`）は Enter で承認します。
-restore の RC 登録確認ループ中も 2 秒ごとにこのダイアログ処理を行います。
+trust 確認（`Yes, I trust`）への Enter は「プロジェクトの `.claude/settings.json` の権限を確認なしで適用する」承認そのものなので、自動送信するのは `recover --auto-confirm` を明示したときだけです。
+restore は trust 確認を自動承認せず、`N 個のセッションが確認ダイアログ待ちです（trust 確認は自動承認しません）` と表示して人間の応答に委ねます（`tmux attach` して内容を確認してから応答してください）。
+restore の RC 登録確認ループ中も 2 秒ごとにこのダイアログ処理を行います（同じく trust は自動承認しません）。
 
 **RC は起動時に明示します**:
-restore は `claude --resume <sessionId> --remote-control <会話名>` で起動します。
+restore / recover は `claude --resume <sessionId> --remote-control <会話名>` で起動します。
 `remoteControlAtStartup` の設定に依存しないため、設定が無い環境でもそのまま RC 接続されます。
 会話名は claude.ai/code のセッション名として渡されるので、一覧で見分けが付きます。
 `CLAUDE_RC_CLAUDE_ARGS` で `--remote-control` を自分で指定した場合は、そちらが使われます（二重指定にはなりません）。
@@ -238,6 +246,7 @@ RC だけが切れている場合は `reconnect` を使ってください。
 
 restore / recover はセッションの同時起動による credential の同時発行・同時失効を緩和するため、既定で 3 件ずつ起動し、各波ごとに RC 登録を確認してから次へ進みます。
 1 つの波で登録確認がタイムアウトした場合は「◯件がRC未登録のまま。続行しますか(y/N)」と確認します（`--yes` で自動続行）。
+この確認は端末（`/dev/tty`）から読むため、cron などの端末が無い環境では確認できずに中断します。自動実行では `--yes` を付けてください。
 波のサイズは `--wave-size <N>` または `CLAUDE_RC_WAVE_SIZE` で変更でき、`--wave-size 0` なら従来どおり全候補を一括起動して最後にまとめて確認します。
 各ウィンドウの起動間隔は引き続き既定で 3 秒空けます（`CLAUDE_RC_STAGGER_SECS` で変更、`0` で無効化）。
 
@@ -318,7 +327,7 @@ $ claude-rc-reattach recover --dry-run
 |---|---|
 | `--within <hours>` | 対象とする時間（既定: 6） |
 | `--auto-confirm` | 起動後の確認ダイアログに Enter を自動送信 |
-| `--limit <N>` | 起動する復元候補の上限（既定: `CLAUDE_RC_MAX_SESSIONS` / 10。`0` で無制限） |
+| `--limit <N>` | 起動する復元候補の上限（既定: `CLAUDE_RC_MAX_SESSIONS` / 15。`0` で無制限） |
 | `--resume-mode as-is\|summary` | 「Resume full session as-is」ダイアログの選択（既定: `as-is`） |
 | `--yes` | メモリ予算の確認プロンプトを省略 |
 | `--no-rename` | 復帰セッションに名前を付けない |
@@ -327,7 +336,7 @@ $ claude-rc-reattach recover --dry-run
 
 **確認ダイアログについて**:
 recover は manifest 経由ではないため、起動後に trust 確認（`Do you trust the files in this folder?`）や「Resume from summary」のダイアログで止まることがあります。
-起動から少し待って（既定 15 秒 / `CLAUDE_RC_CONFIRM_WAIT`）各ウィンドウを覗き、ダイアログが出ていれば件数を表示します:
+起動から少し待って（既定 10 秒 / `CLAUDE_RC_CONFIRM_WAIT`）各ウィンドウを覗き、ダイアログが出ていれば件数を表示します:
 
 ```
 ⚠ 2 個のセッションが確認ダイアログ待ちです。--auto-confirm で自動応答できます
@@ -335,6 +344,9 @@ recover は manifest 経由ではないため、起動後に trust 確認（`Do 
 
 `--auto-confirm` を付けると Enter を自動送信して進めます（既定の選択肢を選ぶため、最大 3 段まで）。
 **どのフォルダを信頼するかを自動承認することになるため、身に覚えのないディレクトリが候補に出ていないかを `--dry-run` で確認してから使ってください。**
+
+ダイアログ待ちが残っていても、そこで打ち切らずに RC 登録の確認と recap まで進めます（1 件のダイアログ待ちで、既に RC 接続できている他の会話の要約まで送られなくなるのを避けるため）。
+ダイアログ待ちがあった場合の終了コードは `1` です。
 
 ### prune（古い復元 pane の店じまい）
 
@@ -352,9 +364,13 @@ claude-rc-reattach prune --idle 12 --yes
 `prune` は tmux の復元用セッション（既定: `rc-restore` / `CLAUDE_RC_TMUX_SESSION`）配下の pane だけを見ます。
 通常のターミナルで動いている Claude Code や、別の tmux セッションには触りません。
 
-各 pane について会話IDを `@rc_sid`、Claude Code の状態ファイル、`--resume` 引数から特定し、対応する会話ログ（`~/.claude/projects/*/<sessionId>.jsonl`）の最終更新が `--idle` 時間より古いものを列挙します。
+各 pane について会話IDを「いま動いている Claude Code の状態ファイル → `@rc_sid` → `--resume` 引数」の順で特定し、対応する会話ログ（`~/.claude/projects/*/<sessionId>.jsonl`）の最終更新が `--idle` 時間より古いものを列挙します。
+状態ファイルを優先するのは、`--force` で `--fork-session` 復帰した pane では走っている会話IDが `@rc_sid`（復元元のID）と別物になり、`@rc_sid` の会話ログが fork 時点で止まるためです（作業中の pane を idle と誤判定して閉じないようにしています）。
 実行時は `N件を店じまいします(会話の記録は残り、いつでも restore/recover で戻せます)` と確認し、対象 pane に `C-c` → `/exit` → Enter を送ります。
-5秒待って残っている場合だけ、その tmux window を閉じます。
+確認ダイアログ（trust 確認 / `Resume full session as-is` / `Enter to confirm`）が出ている pane は、キーを送らずスキップして人間に返します。
+ダイアログで止まった pane は会話が進まないぶん会話ログが古いままで prune 候補の上位に来ますが、そこへ Enter を送ると restore / recover が人間の判断に委ねたはずの trust 承認を prune が通してしまうためです。
+5秒待って残っている場合だけ、その pane を `kill-pane` で閉じます（window 単位で落とすと、ユーザーが `Ctrl-b "` で分割して下段で回している作業まで巻き添えで殺すため）。
+分割していない window は、対象 pane を閉じた結果として window ごと消えます。
 
 | オプション | 動作 |
 |---|---|
@@ -427,14 +443,14 @@ CLAUDE_RC_CLAUDE_ARGS="--dangerously-skip-permissions --append-system-prompt '�
 |---|---|---|
 | `CLAUDE_RC_MANIFEST` | `~/.local/state/claude-rc-reattach/manifest.tsv` | manifest の保存先 |
 | `CLAUDE_RC_TMUX_SESSION` | `rc-restore` | 復帰先の tmux セッション名 |
-| `CLAUDE_RC_CLAUDE_ARGS` | （なし） | restore 時に `claude` コマンドへ追加するオプション（スペース区切りで複数可。値にスペースを含む場合は `'...'` か `"..."` で囲む） |
+| `CLAUDE_RC_CLAUDE_ARGS` | （なし） | restore / recover 時に `claude` コマンドへ追加するオプション（スペース区切りで複数可。値にスペースを含む場合は `'...'` か `"..."` で囲む） |
 | `CLAUDE_RC_MAX_AGE_DAYS` | `0` | 最終チャットからこの日数を超えた会話を restore で skip する（`0` = skip しない。1 以上で有効） |
 | `CLAUDE_RC_VERIFY_TIMEOUT` | `60` | restore / reconnect 後に RC 登録を確認する最大秒数（`0` で確認しない） |
 | `CLAUDE_RC_STAGGER_SECS` | `3` | restore で各セッションを起動する間隔の秒数（credential の同時発行・同時失効の緩和用。`0` で無効化） |
 | `CLAUDE_RC_RECAP_PROMPT` | `アカウント切替で画面上の履歴が空になっています。これまでの会話の経緯・決定事項・いま取り組んでいる作業を10行以内で要約して表示してください。` | recap で送るプロンプト（必ず 1 行で書くこと） |
 | `CLAUDE_RC_RECOVER_HOURS` | `6` | recover が対象とする時間（`--within` を付けた場合はそちらが優先） |
 | `CLAUDE_RC_CONFIRM_WAIT` | `10` | recover で確認ダイアログを見に行くまでの待ち秒数 |
-| `CLAUDE_RC_MAX_SESSIONS` | `10` | restore / recover で起動する復元候補の既定上限（`0` = 無制限） |
+| `CLAUDE_RC_MAX_SESSIONS` | `15` | restore / recover で起動する復元候補の既定上限（`0` = 無制限） |
 
 ## 仕組み
 

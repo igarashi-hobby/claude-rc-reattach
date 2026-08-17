@@ -31,6 +31,10 @@ WAVE_SIZE="${CLAUDE_RC_WAVE_SIZE:-3}"
 CONFIRM_PENDING=0   # handle_confirm_dialogs の結果（ダイアログ待ちの pane 数）
 RESUME_MODE="as-is"
 CONFIRM_DIALOG_ENTRIES=()
+# wait_rc_registration のループ内から handle_confirm_dialogs を呼ぶときの auto 値。
+# trust 系ダイアログ（プロジェクト設定・権限の無確認適用 / managed settings 承認）への
+# Enter は「承認」そのものなので、--auto-confirm を明示した recover 以外では 0 のままにする
+CONFIRM_AUTO=0
 # recap で送るプロンプト。復帰後の RC セッションには切り替え前の履歴が送られない
 # （Claude Code のクロスアカウント抑止）ため、要約を 1 通送って文脈をリモートに残す。
 # 送信後すぐ Enter を打つので、必ず 1 行で書くこと
@@ -340,7 +344,10 @@ wait_rc_registration() {
     (( all_done )) && break
     (( $(date +%s) >= deadline )) && break
     if (( ${#CONFIRM_DIALOG_ENTRIES[@]} > 0 )); then
-      handle_confirm_dialogs 1 "$RESUME_MODE" "${CONFIRM_DIALOG_ENTRIES[@]}"
+      # auto はハードコードせず呼び出し元の指定（CONFIRM_AUTO）に従う。
+      # ここで 1 を固定すると、--auto-confirm を付けていない restore でも
+      # trust 確認に Enter が送られ、権限設定を無断承認してしまう
+      handle_confirm_dialogs "$CONFIRM_AUTO" "$RESUME_MODE" "${CONFIRM_DIALOG_ENTRIES[@]}"
     fi
     sleep 2
   done
@@ -380,8 +387,15 @@ confirm_wave_continue() {
     warn "${count}件がRC未登録のまま。--yes のため続行します"
     return 0
   fi
+  # この関数は restore / recover の起動ループ（done <<< "$limited_rows"）の内側から呼ばれる。
+  # ループの stdin は未処理の候補行なので、端末から読まないと次の候補行を回答として
+  # 食ってしまい（その会話は起動もされず黙って消える）、y/N の確認も成立しない
+  if [[ ! -c /dev/tty ]] || ! { : </dev/tty ; } 2>/dev/null; then
+    warn "${count}件がRC未登録のまま。端末が無いため確認できません → 中断します（自動実行では --yes を付けてください）"
+    return 1
+  fi
   printf "%s件がRC未登録のまま。続行しますか(y/N): " "$count"
-  read -r ans || ans=""
+  read -r ans </dev/tty || ans=""
   [[ "$ans" == [yY]* ]]
 }
 
@@ -394,7 +408,7 @@ pick_rows() {
   fi
   [[ -n "$rows" ]] || return 0
   print -- "復元候補:" >&2
-  print -r -- "$rows" | python3 -c '
+  if ! print -r -- "$rows" | python3 -c '
 import datetime, sys
 mode = sys.argv[1]
 for i, line in enumerate(sys.stdin.read().splitlines(), 1):
@@ -418,8 +432,13 @@ for i, line in enumerate(sys.stdin.read().splitlines(), 1):
         cwd = parts[2] if len(parts) > 2 else ""
         title = parts[4] if len(parts) > 4 else ""
         name = title or sid
-    print(f"{i}\t{when}\t{name or \"(無名)\"}\t{cwd or \"(不明)\"}")
-' "$mode" >&2
+    # f-string の置換フィールドにバックスラッシュは書けない（どの Python でも SyntaxError）ため
+    # 一覧の整形は % 書式で行う
+    print("%s\t%s\t%s\t%s" % (i, when, name or "(無名)", cwd or "(不明)"))
+' "$mode" >&2; then
+    err "復元候補の一覧表示に失敗しました"
+    return 1
+  fi
   printf "復元する番号をカンマ区切りで入力(例: 1,3,5)。a=全部、q=中止: " >&2
   read -r ans || ans=""
   case "$ans" in
@@ -601,32 +620,63 @@ print(int(epoch))
 PY
 }
 
-# 会話ログの最初のユーザー発言から表示名に使える短い文字列を作る
+# 会話ログから表示名に使える短い文字列を作る
+#   優先順位: custom-title / agent-name（会話に付いている名前。ログ先頭に来ることが多い）
+#           → 最初のユーザー発言
+#   Claude Code はスラッシュコマンド実行時や継続起動時に、先頭のユーザーエントリとして
+#   <local-command-caveat> / <command-name> / <system-reminder> を注入する。
+#   これを素で採用すると 'localcommandcaveatCaveat The m' のような名前になるため、
+#   タグの中身は落とし、残りが空の発言は飛ばして次の発言を見る
 transcript_first_user_title() {
   python3 - "$1" <<'PY'
 import json, re, sys
+
+MAX_LINES = 500  # 名前はログ先頭付近にしかないので、巨大ログを読み切らない
+
+# Claude Code が注入する制御タグ（閉じタグが無い場合は行末まで）
+TAG_RE = re.compile(
+    r"(?is)<(local-command-caveat|system-reminder|command-name|command-message|"
+    r"command-args|command-contents|command-stdout|command-stderr)\b.*?(?:</\1>|$)")
+
+
+def clean(s):
+    s = TAG_RE.sub(" ", s)
+    s = re.sub(r"[\r\n\t]+", " ", s)
+    s = re.sub(r"[^\w\s一-龯ぁ-んァ-ヶー]", "", s, flags=re.UNICODE)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+title = ""
+first_user = ""
 try:
     with open(sys.argv[1], "r", encoding="utf-8", errors="replace") as f:
-        for line in f:
+        for i, line in enumerate(f):
+            if i >= MAX_LINES or title:
+                break
             try:
                 d = json.loads(line)
             except Exception:
                 continue
-            if d.get("type") != "user" or d.get("isSidechain"):
+            t = d.get("type")
+            if t in ("custom-title", "agent-name"):
+                v = d.get("customTitle") or d.get("agentName") or ""
+                if isinstance(v, str):
+                    title = clean(v)
+                continue
+            if first_user or t != "user" or d.get("isSidechain"):
                 continue
             c = d.get("message", {}).get("content")
             if isinstance(c, list):
                 c = " ".join(p.get("text", "") for p in c if isinstance(p, dict))
             if not isinstance(c, str):
                 continue
-            c = re.sub(r"[\r\n\t]+", " ", c)
-            c = re.sub(r"[^\w\s一-龯ぁ-んァ-ヶー]", "", c, flags=re.UNICODE)
-            c = re.sub(r"\s+", " ", c).strip()
-            if c:
-                print(c[:30])
-                sys.exit(0)
+            first_user = clean(c)
 except OSError:
     pass
+name = title or first_user
+if name:
+    print(name[:30])
+    sys.exit(0)
 sys.exit(1)
 PY
 }
@@ -748,15 +798,48 @@ confirm_memory_budget() {
   [[ "$ans" == [yY]* ]]
 }
 
+# 未復元の残りを案内する
+#   第 2 引数は案内に出すサブコマンド名。recover の候補は manifest に無いため、
+#   restore を案内すると別の会話が起動してしまう（呼び出し元を必ず渡すこと）
 report_limit_remainder() {
-  local skipped_rows="$1"
+  local skipped_rows="$1" cmd="${2:-restore}"
   local count
   count=$(print -r -- "$skipped_rows" | sed '/^$/d' | wc -l | tr -d ' ')
   (( count > 0 )) || return 0
-  warn "あと${count}件は復元していません。claude-rc-reattach restore --limit で追加できます"
+  warn "あと${count}件は復元していません。claude-rc-reattach ${cmd} --limit で追加できます"
   print -r -- "$skipped_rows" | while IFS=$'\t' read -r _epoch label _rest; do
     [[ -n "$label" ]] && info "• $label"
   done
+}
+
+# 確認ダイアログ待ちで RC 登録が進まなかった場合の案内
+#   trust 系は自動承認しないため、restore ではここで人間に返す
+report_confirm_pending() {
+  (( CONFIRM_PENDING > 0 )) || return 0
+  warn "${CONFIRM_PENDING} 個のセッションが確認ダイアログ待ちです（trust 確認は自動承認しません）"
+  info "（tmux attach -t $TMUX_SESSION でウィンドウを開き、内容を確認して手動で応答してください）"
+}
+
+# tmux ウィンドウ名を作る
+#   [^A-Za-z0-9_.-] を一括で潰すと日本語のラベルが全てダッシュになり（例:
+#   「ミチガエル経営ダッシュボード」→「--------------」）、attach しても
+#   どのウィンドウがどの会話か分からない。手動 kill-window の誤爆や reconnect の
+#   出力での取り違えを招くため、非 ASCII はそのまま残す（tmux の名前は UTF-8 可）。
+#   置き換えるのは tmux のターゲット指定で意味を持つ . : と空白・制御文字だけ。
+#   先頭に sessionId の先頭 8 桁を付けて、同名ラベルでも一意に見分けられるようにする
+tmux_window_name() {
+  local label="$1" sid="${2:-}" name prefix
+  name="${label//[[:space:][:cntrl:]]/-}"
+  name="${name//[.:]/-}"
+  [[ -z "$name" ]] && name="session"
+  # 日本語は 1 文字あたり表示幅 2 になるため、ラベル部分は 20 文字までに抑える
+  eval 'name="${name[1,20]}"'
+  if [[ -n "$sid" ]]; then
+    eval 'prefix="${sid[1,8]}"'
+    print -r -- "${prefix}-${name}"
+  else
+    print -r -- "$name"
+  fi
 }
 
 # tmux セッション "$TMUX_SESSION" に窓を作って claude を起動し、"pane_id<TAB>pane_pid" を返す
@@ -893,7 +976,9 @@ handle_confirm_dialogs() {
 import os, re, sys
 mode = sys.argv[1]
 text = os.environ.get("CHOICE_TEXT", "")
-choices = re.findall(r"(?m)^\s*([0-9]+)\.\s*(.+?)\s*$", text)
+# フォーカス中の行は先頭にポインタ（❯）などの装飾が付くため、行頭の非数字は読み飛ばす
+# （\s* だけだと "❯ 1. Resume from summary" に一致せず、選択肢を取りこぼす）
+choices = re.findall(r"(?m)^[^0-9\n]*([0-9]+)\.\s*(.+?)\s*$", text)
 if mode == "as-is":
     for n, label in choices:
         if "Resume full session as-is" in label:
@@ -901,7 +986,14 @@ if mode == "as-is":
             break
 else:
     for n, label in choices:
-        if "Resume full session as-is" not in label:
+        if "Resume from summary" in label:
+            print(n)
+            break
+    else:
+        # 表記が変わった場合の保険。"Don't ask me again"（以後この確認を出さない設定）は選ばない
+        for n, label in choices:
+            if "Resume full session as-is" in label or "ask me again" in label:
+                continue
             print(n)
             break
 PY
@@ -917,7 +1009,10 @@ PY
         (( pending++ )) || true
         break
       elif [[ "$out" == *"Yes, I trust"* ]]; then
-        if (( step > 3 )); then
+        # trust 系ダイアログへの Enter は「承認」そのもの（.claude/settings.json の
+        # permissions.allow の無確認適用 / managed settings の承認）なので、
+        # --auto-confirm を明示していない限り自動応答せず、人間の判断に返す
+        if (( ! auto || step > 3 )); then
           (( pending++ )) || true
           break
         fi
@@ -986,14 +1081,36 @@ cmd_save() {
     printf '%s\t%s\t%s\t%s\t%s\n' "$sid" "$cwd" "$name" "$pid" "$(detect_perm_flags "$pid")"
   done)
 
-  mkdir -p "${MANIFEST:h}"
-  local email
+  # 書き込みの成否は必ず判定する。switch はこの直後に logout するため、
+  # 書けていないのに「保存しました」と返すと旧アカウントのトークンを失効させたあとで
+  # manifest が無いことに気づく（復帰不能）ことになる
+  if ! mkdir -p "${MANIFEST:h}" 2>/dev/null; then
+    err "manifest の保存先ディレクトリを作成できません: ${MANIFEST:h}"
+    err "（CLAUDE_RC_MANIFEST の指定を確認してください）"
+    return 1
+  fi
+  local email tmp_manifest
   email=$(auth_info | awk '{print $3}')
-  {
+  # 一時ファイルへ書いてから mv で差し替える（途中で失敗・中断しても
+  # 前回の正常な manifest を半端な内容で上書きしないため）
+  if ! tmp_manifest=$(mktemp "${MANIFEST:h}/.manifest.XXXXXX" 2>/dev/null) || [[ -z "$tmp_manifest" ]]; then
+    err "manifest の一時ファイルを作成できません: ${MANIFEST:h}"
+    return 1
+  fi
+  if ! {
     print -- "# claude-rc-reattach manifest v2"
     print -- "# saved_at=$(date '+%Y-%m-%dT%H:%M:%S%z') account=$email"
     print -r -- "$rows_ext"
-  } > "$MANIFEST"
+  } > "$tmp_manifest"; then
+    err "manifest の書き込みに失敗しました: $MANIFEST"
+    rm -f "$tmp_manifest"
+    return 1
+  fi
+  if ! mv -f "$tmp_manifest" "$MANIFEST" 2>/dev/null; then
+    err "manifest を配置できません: $MANIFEST"
+    rm -f "$tmp_manifest"
+    return 1
+  fi
   local n
   n=$(print -r -- "$rows_ext" | wc -l | tr -d ' ')
   ok "$n 件の会話を保存しました → $MANIFEST"
@@ -1016,6 +1133,8 @@ cmd_save() {
 cmd_restore() {
   local fork=1 dry=0 inherit_perms=1 force=0 rename=1 recap=1 inherit_bypass=0 yes=0 limit="$MAX_SESSIONS" pick=0 wave_size="$WAVE_SIZE"
   RESUME_MODE="as-is"
+  # restore に --auto-confirm は無い。trust 確認は自動承認せず人間に返す
+  CONFIRM_AUTO=0
   while (( $# )); do
     case "$1" in
       --fork)    fork=1 ;;
@@ -1093,6 +1212,8 @@ cmd_restore() {
   esac
 
   # いま別プロセスで開かれている・すでに復帰済みの会話（同じ会話を二重に立ち上げないため）
+  # 波ごとの RC 確認で全体は数分かかるため、この一覧はループ内で 1 件ごとに取り直す
+  # （起動中に別の restore や手動の claude --resume が始まっても検知できるようにする）
   local open_ids
   open_ids=$(running_session_ids)
 
@@ -1140,7 +1261,7 @@ cmd_restore() {
   restored_ids=$(tmux list-panes -s -t "=$TMUX_SESSION" -F '#{pane_dead} #{@rc_sid}' 2>/dev/null \
     | while read -r _dead _sid; do [[ "$_dead" == 0 && -n "$_sid" ]] && print -r -- "$_sid"; done)
 
-  local manifest_rows sorted_rows limited_rows remainder_rows planned_count
+  local manifest_rows sorted_rows eligible_rows limited_rows remainder_rows planned_count skipped_pre=0
   manifest_rows=$(while IFS= read -r line; do
     [[ -z "$line" || "$line" == \#* ]] && continue
     eval 'f=("${(@ps:\t:)line}")'
@@ -1154,11 +1275,79 @@ cmd_restore() {
     fi
     printf '%s\t%s\t%s\n' "$last_epoch" "$label" "$line"
   done < "$MANIFEST" | sort -rn -t $'\t' -k1,1)
+
+  # limit を掛ける前に「確実に skip になる行」を落とす。
+  # 実行中の会話は会話ログが最も新しいためソートの先頭に並ぶので、先に切り詰めると
+  # skip 行が limit の枠を食い潰し、案内どおり restore --limit を再実行しても
+  # 未起動の会話に永久に到達できない（起動 0 件・終了コード 1 のまま）
+  local pre_now pre_sid pre_cwd pre_name pre_label pre_epoch pre_slabel pre_line pre_age
+  local -a eligible_lines pre_f
+  typeset -A pre_seen_sids
+  eligible_lines=()
+  pre_now=$(date +%s)
+  while IFS=$'\t' read -r pre_epoch pre_slabel pre_line; do
+    [[ -z "$pre_line" ]] && continue
+    eval 'pre_f=("${(@ps:\t:)pre_line}")'
+    pre_sid="${pre_f[1]:-}"; pre_cwd="${pre_f[2]:-}"; pre_name="${pre_f[3]:-}"
+    [[ -z "$pre_sid" ]] && continue
+    pre_label="${pre_name:-$pre_sid}"
+
+    if [[ -n "${pre_seen_sids[$pre_sid]:-}" ]]; then
+      warn "$pre_label: manifest 内で重複している会話です → skip（同じ会話ログへの多重書き込みを防ぐため）"
+      (( skipped_pre++ )) || true
+      continue
+    fi
+    pre_seen_sids[$pre_sid]=1
+
+    if print -r -- "$restored_ids" | grep -Fqx -- "$pre_sid"; then
+      warn "$pre_label: 既に復帰済みで tmux ウィンドウが生きています → skip"
+      info "  RC が切れている場合は claude-rc-reattach reconnect を使ってください"
+      (( skipped_pre++ )) || true
+      continue
+    fi
+
+    if [[ ! -d "$pre_cwd" ]]; then
+      err "$pre_label: 作業ディレクトリが存在しません → skip ($pre_cwd)"
+      (( skipped_pre++ )) || true
+      continue
+    fi
+
+    if ! find_transcript "$pre_cwd" "$pre_sid" >/dev/null 2>&1; then
+      err "$pre_label: 会話ログが見つかりません → skip (~/.claude/projects/*/$pre_sid.jsonl)"
+      (( skipped_pre++ )) || true
+      continue
+    fi
+
+    if (( MAX_AGE_DAYS > 0 && pre_now - pre_epoch > MAX_AGE_DAYS * 86400 )); then
+      (( pre_age = (pre_now - pre_epoch) / 86400 )) || true
+      warn "$pre_label: 最終チャットが ${pre_age} 日前（上限 ${MAX_AGE_DAYS} 日）→ skip"
+      (( skipped_pre++ )) || true
+      continue
+    fi
+
+    if print -r -- "$open_ids" | grep -Fqx -- "$pre_sid"; then
+      if (( ! force )); then
+        info "skip (already running): $pre_label"
+        (( skipped_pre++ )) || true
+        continue
+      fi
+      if (( ! fork )); then
+        err "$pre_label: この会話は別プロセスで開いたままです → skip（--force --no-fork 指定のため。複製復帰でよければ --no-fork を外して実行）"
+        (( skipped_pre++ )) || true
+        continue
+      fi
+    fi
+
+    eligible_lines+=("${pre_epoch}"$'\t'"${pre_slabel}"$'\t'"${pre_line}")
+  done <<< "$manifest_rows"
+  # zsh 専用の展開は bash -n でも構文エラーにならないよう eval 経由で書く
+  eval 'eligible_rows="${(F)eligible_lines}"'
+
   if (( limit > 0 )); then
-    limited_rows=$(print -r -- "$manifest_rows" | awk -F '\t' -v limit="$limit" 'NR <= limit')
-    remainder_rows=$(print -r -- "$manifest_rows" | awk -F '\t' -v limit="$limit" 'NR > limit')
+    limited_rows=$(print -r -- "$eligible_rows" | awk -F '\t' -v limit="$limit" 'NR <= limit')
+    remainder_rows=$(print -r -- "$eligible_rows" | awk -F '\t' -v limit="$limit" 'NR > limit')
   else
-    limited_rows="$manifest_rows"
+    limited_rows="$eligible_rows"
     remainder_rows=""
   fi
   if (( pick )); then
@@ -1172,7 +1361,8 @@ cmd_restore() {
     }
   fi
 
-  local resumed=0 skipped=0 now
+  # limit 適用前に落とした分も skip 件数に含める（完了行の集計を実態と合わせるため）
+  local resumed=0 skipped=$skipped_pre now
   now=$(date +%s)
   local sid cwd name opid perm label restored_name rc_name transcript win cmd_str last_epoch age_days pane_info pane_id pane_pid line sort_epoch sort_label wave_rc unregistered
   local -a claude_cmd perm_args v_entries d_entries wave_v_entries wave_d_entries f
@@ -1198,6 +1388,13 @@ cmd_restore() {
       continue
     fi
     seen_sids[$sid]=1
+
+    # 二重起動の判定は起動の直前に取り直す。ループ前の 1 回きりだと、波ごとの RC 待ち
+    # （既定で最大 60 秒 × 波数）の間に他所で開かれた会話を見落とし、同じ会話ログに
+    # 2 プロセスが書き込む
+    open_ids=$(running_session_ids)
+    restored_ids=$(tmux list-panes -s -t "=$TMUX_SESSION" -F '#{pane_dead}'$'\t''#{@rc_sid}' </dev/null 2>/dev/null \
+      | while IFS=$'\t' read -r _dead _sid; do [[ "$_dead" == 0 && -n "$_sid" ]] && print -r -- "$_sid"; done)
 
     # 既にこのツールで復帰済み（tmux ウィンドウが生きている）なら二重起動しない
     if print -r -- "$restored_ids" | grep -Fqx -- "$sid"; then
@@ -1291,8 +1488,7 @@ cmd_restore() {
       fi
     fi
 
-    win="${label//[^A-Za-z0-9_.-]/-}"
-    eval 'win="${win[1,30]}"'
+    win=$(tmux_window_name "$label" "$sid")
 
     # tmux はコマンドをシェル文字列として受け取り sh -c で実行するため、
     # 各引数を個別にクォートしておく（スペースを含む CLAUDE_RC_CLAUDE_ARGS が分裂するのを防ぐ）
@@ -1343,7 +1539,7 @@ cmd_restore() {
   if (( aborted )); then
     print
     err "波状起動を中断しました"
-    report_limit_remainder "$remainder_rows"
+    report_limit_remainder "$remainder_rows" restore
     return 1
   fi
 
@@ -1357,11 +1553,11 @@ cmd_restore() {
     if (( skipped == 0 )); then
       warn "manifest に復帰対象の会話がありません（save は実行済みですか）"
     fi
-    report_limit_remainder "$remainder_rows"
+    report_limit_remainder "$remainder_rows" restore
     return 1
   fi
   if (( dry )); then
-    report_limit_remainder "$remainder_rows"
+    report_limit_remainder "$remainder_rows" restore
     return $rc
   fi
 
@@ -1382,7 +1578,7 @@ cmd_restore() {
             wave_failed=1
           else
             err "波状起動を中断しました"
-            report_limit_remainder "$remainder_rows"
+            report_limit_remainder "$remainder_rows" restore
             return 1
           fi
         fi
@@ -1391,6 +1587,7 @@ cmd_restore() {
         warn "RC 未登録の会話があります。以下で再接続を試してください:"
         info "claude-rc-reattach reconnect"
         info "（または tmux attach -t $TMUX_SESSION で該当ウィンドウを開き、手動で /remote-control を実行）"
+        report_confirm_pending
         rc=1
       else
         ok "すべての会話の RC 登録を確認しました"
@@ -1408,6 +1605,7 @@ cmd_restore() {
         warn "RC 未登録の会話があります。以下で再接続を試してください:"
         info "claude-rc-reattach reconnect"
         info "（または tmux attach -t $TMUX_SESSION で該当ウィンドウを開き、手動で /remote-control を実行）"
+        report_confirm_pending
         rc=1
       fi
       CONFIRM_DIALOG_ENTRIES=()
@@ -1428,7 +1626,7 @@ cmd_restore() {
   else
     info "  --no-recap 指定のため、要約送信は行いません"
   fi
-  report_limit_remainder "$remainder_rows"
+  report_limit_remainder "$remainder_rows" restore
   return $rc
 }
 
@@ -1498,6 +1696,9 @@ cmd_recover() {
   need claude
   (( dry )) || need_tmux || return 1
 
+  # RC 登録待ちループ中のダイアログ処理にも --auto-confirm の指定を渡す
+  CONFIRM_AUTO=$auto_confirm
+
   local rows
   local -a running_ids
   eval 'running_ids=(${(f)"$(running_session_ids)"})'
@@ -1536,10 +1737,24 @@ cmd_recover() {
     fi
   fi
 
+  # CLAUDE_RC_CLAUDE_ARGS: claude コマンドに追加するオプション（restore と同じ扱い）
+  # (z) でシェルと同じ規則に分割し、(Q) で引数を囲むクォートを外す
+  local -a claude_extra
+  eval 'claude_extra=(${(Q)${(z)${CLAUDE_RC_CLAUDE_ARGS:-}}})'
+  (( ${#claude_extra} )) && info "claude 追加オプション: ${claude_extra[*]}"
+
+  # RC は起動時に明示する。settings.json の remoteControlAtStartup 頼みだと、
+  # 設定が無い / 効いていない環境では波ごとに VERIFY_TIMEOUT 秒待たされ、
+  # 最後は ⚠ + reconnect 送りになり recap も 1 通も飛ばない（restore と同じ理由）。
+  # 環境変数側で既に指定されている場合は二重指定しない
+  local rc_flag=1
+  [[ "${claude_extra[*]}" == *--remote-control* ]] && rc_flag=0
+
   print -- "復旧候補（直近 ${hours} 時間・実行中のものを除く）:"
   # 注意: zsh ではループ内で `local` を再宣言すると変数の中身が出力されるため、
   # ループで使う変数はここでまとめて宣言する
   local when sid cwd proj title label win cmd_str pane_info pane_id pane_pid last_proj="" transcript wave_rc unregistered
+  local restored_name rc_name
   local recovered=0 skipped=0
   local -a claude_cmd v_entries d_entries wave_v_entries wave_d_entries
   v_entries=()
@@ -1564,11 +1779,23 @@ cmd_recover() {
     fi
 
     transcript=$(find_transcript "$cwd" "$sid" 2>/dev/null) || transcript=""
-    claude_cmd=(claude --resume "$sid")
-    (( name_ok )) && claude_cmd+=(-n "$(restored_session_name "$label" "$transcript" "$cwd")")
+    claude_cmd=(claude --resume "$sid" "${claude_extra[@]}")
+    restored_name=""
+    if (( name_ok )); then
+      restored_name=$(restored_session_name "$label" "$transcript" "$cwd")
+      claude_cmd+=(-n "$restored_name")
+    fi
+    # --remote-control は値を省略できる形式のため、後続の引数を名前と誤解されないよう最後に置く
+    if (( rc_flag )); then
+      rc_name="${restored_name:-$label}"
+      if [[ -n "$rc_name" && "$rc_name" != -* ]]; then
+        claude_cmd+=(--remote-control "$rc_name")
+      else
+        claude_cmd+=(--remote-control)
+      fi
+    fi
 
-    win="${label//[^A-Za-z0-9_.-]/-}"
-    eval 'win="${win[1,30]}"'
+    win=$(tmux_window_name "$label" "$sid")
 
     # tmux はコマンドをシェル文字列として受け取り sh -c で実行するため、各引数を個別にクォートする
     eval 'cmd_str="${(j: :)${(q-)claude_cmd[@]}}"'
@@ -1624,24 +1851,28 @@ cmd_recover() {
   if (( aborted )); then
     print
     err "波状起動を中断しました"
-    report_limit_remainder "$remainder_rows"
+    report_limit_remainder "$remainder_rows" recover
     return 1
   fi
 
   print
   if (( dry )); then
     ok "候補 $recovered 件 / skip $skipped 件（--dry-run のため起動していません）"
-    report_limit_remainder "$remainder_rows"
+    report_limit_remainder "$remainder_rows" recover
     return 0
   fi
   ok "完了: 起動 $recovered 件 / skip $skipped 件"
   if (( recovered == 0 )); then
-    report_limit_remainder "$remainder_rows"
+    report_limit_remainder "$remainder_rows" recover
     return 0
   fi
 
   # restore と違い trust ダイアログや「Resume from summary」で止まることがある
   # （manifest 経由でないぶん、最後に開いた状態が読めないため）
+  #   ここで return してしまうと、既に RC 接続できている他のセッションまで
+  #   RC 登録確認と recap を丸ごと落とす（1 件のダイアログ待ちで全件が要約なしになる）。
+  #   ダイアログ待ちは終了コードにだけ反映し、処理は最後まで進める
+  local rc=0
   if (( wave_size == 0 || VERIFY_TIMEOUT == 0 || ${#wave_d_entries} > 0 )); then
     sleep "$CONFIRM_WAIT"
     if (( wave_size > 0 && VERIFY_TIMEOUT > 0 )); then
@@ -1653,12 +1884,11 @@ cmd_recover() {
       print
       warn "${CONFIRM_PENDING} 個のセッションが確認ダイアログ待ちです。--auto-confirm で自動応答できます"
       info "（または tmux attach -t $TMUX_SESSION でウィンドウを開き、手動で Enter）"
-      report_limit_remainder "$remainder_rows"
-      return 1
+      info "ダイアログ待ち以外の会話は、このまま RC 登録確認と要約送信まで進めます"
+      rc=1
     fi
   fi
 
-  local rc=0
   if (( VERIFY_TIMEOUT > 0 )); then
     print
     if (( wave_size > 0 )); then
@@ -1674,7 +1904,7 @@ cmd_recover() {
             wave_failed=1
           else
             err "波状起動を中断しました"
-            report_limit_remainder "$remainder_rows"
+            report_limit_remainder "$remainder_rows" recover
             return 1
           fi
         fi
@@ -1683,6 +1913,9 @@ cmd_recover() {
         warn "RC 未登録の会話があります。以下で再接続を試してください:"
         info "claude-rc-reattach reconnect"
         rc=1
+      elif (( rc )); then
+        # 確認ダイアログ待ちが残っている（rc=1）状態で「すべて確認しました」とは言わない
+        warn "確認ダイアログ待ちの会話を除き、RC 登録を確認しました"
       else
         ok "すべての会話の RC 登録を確認しました"
         info "claude.ai/code または モバイルアプリに新しいセッションとして表示されます"
@@ -1692,8 +1925,12 @@ cmd_recover() {
       CONFIRM_DIALOG_ENTRIES=("${d_entries[@]}")
       if wait_rc_registration "$VERIFY_TIMEOUT" "${v_entries[@]}"; then
         print
-        ok "すべての会話の RC 登録を確認しました"
-        info "claude.ai/code または モバイルアプリに新しいセッションとして表示されます"
+        if (( rc )); then
+          warn "確認ダイアログ待ちの会話を除き、RC 登録を確認しました"
+        else
+          ok "すべての会話の RC 登録を確認しました"
+          info "claude.ai/code または モバイルアプリに新しいセッションとして表示されます"
+        fi
       else
         print
         warn "RC 未登録の会話があります。以下で再接続を試してください:"
@@ -1710,14 +1947,15 @@ cmd_recover() {
     else
       info "  --no-recap 指定のため、要約送信は行いません"
     fi
-    report_limit_remainder "$remainder_rows"
+    report_limit_remainder "$remainder_rows" recover
     return $rc
   else
     print
     info "確認方法:"
     info "  tmux attach -t $TMUX_SESSION     # 各ウィンドウのフッターに /rc active が出ていれば成功"
     info "  --no-recap を付けていない場合も、RC 登録確認を無効化しているため要約は自動送信しません"
-    report_limit_remainder "$remainder_rows"
+    report_limit_remainder "$remainder_rows" recover
+    return $rc
   fi
 }
 
@@ -1866,7 +2104,11 @@ def state_for_pane(pane_pid):
 
 for pane in panes:
     st = state_for_pane(pane["pane_pid"])
-    sid = pane["rc_sid"] or (st[1] if st else "") or sid_from_process_args(pane["pane_pid"])
+    # いま動いている claude 本人の sessionId を最優先する。
+    # @rc_sid は復元元の sessionId なので、--fork-session で復帰した pane では
+    # 別物になり、その会話ログは fork 時点で更新が止まる。@rc_sid を優先すると
+    # 「使用中の pane を idle と判定して閉じる」事故になる
+    sid = (st[1] if st else "") or pane["rc_sid"] or sid_from_process_args(pane["pane_pid"])
     if not sid:
         continue
     label = (st[3] if st and st[3] else "") or pane["win_name"] or sid
@@ -1919,9 +2161,21 @@ PY
     [[ "$ans" == [yY]* ]] || { warn "中止しました"; return 1; }
   fi
 
-  local closed=0 killed=0 pane_id win_id win_name label sid _mtime when age_h _transcript
+  local closed=0 killed=0 pane_id win_id win_name label sid _mtime when age_h _transcript pane_out
   print -r -- "$candidates" | sort -n -t $'\t' -k1,1 | while IFS=$'\t' read -r _mtime when age_h pane_id win_id win_name sid _transcript label; do
     if ! tmux display-message -p -t "$pane_id" '#{pane_id}' >/dev/null 2>&1; then
+      continue
+    fi
+    # 確認ダイアログ待ちの pane には触らない。
+    # ダイアログで止まった pane は会話が 1 行も進まないため会話ログの mtime が古いままで、
+    # prune 候補の上位に来る。そこへ C-c → "/exit" → Enter を送ると、C-c で TUI が
+    # 終わらなかった場合に最後の Enter が既定選択の確定として解釈され、
+    # restore / recover が人間の判断に返したはずの trust 承認が prune 経由で通ってしまう
+    # （実測: C-c では claude は終了せず "/exit" はダイアログに吸われる）
+    pane_out=$(tmux capture-pane -p -t "$pane_id" 2>/dev/null) || pane_out=""
+    if [[ "$pane_out" == *"Yes, I trust"* || "$pane_out" == *"Enter to confirm"* \
+       || "$pane_out" == *"Resume full session as-is"* ]]; then
+      warn "${label:-$win_name}: 確認ダイアログ待ちのため店じまいしません（tmux attach -t $TMUX_SESSION で応答してください）"
       continue
     fi
     tmux send-keys -t "$pane_id" C-c 2>/dev/null || true
@@ -1931,15 +2185,19 @@ PY
     tmux send-keys -t "$pane_id" Enter 2>/dev/null || true
     sleep 5
     if tmux display-message -p -t "$pane_id" '#{pane_id}' >/dev/null 2>&1; then
-      tmux kill-window -t "$pane_id" 2>/dev/null || true
-      ok "${label:-$win_name}: /exit 後も残っていたため tmux window を閉じました"
+      # kill-window は pane ターゲットを渡してもウィンドウ全体を落とすため、
+      # ユーザーが Ctrl-b " で分割して下段で回している作業（build / tail /
+      # レンダリング等）まで巻き添えで殺してしまう。対象の pane だけを閉じる
+      # （そのウィンドウに他の pane が無ければ結果的にウィンドウも閉じる）
+      tmux kill-pane -t "$pane_id" 2>/dev/null || true
+      ok "${label:-$win_name}: /exit 後も残っていたため tmux pane を閉じました"
       (( killed++ )) || true
     else
       ok "${label:-$win_name}: 正常終了しました"
       (( closed++ )) || true
     fi
   done
-  ok "完了: 正常終了 $closed 件 / kill-window $killed 件"
+  ok "完了: 正常終了 $closed 件 / kill-pane $killed 件"
 }
 
 # restore 後に RC が未登録・切断状態になったセッションへ /remote-control を送って再接続する
@@ -1964,18 +2222,26 @@ cmd_reconnect() {
   # 対象は restore が作った pane（@rc_sid 付き）だけに限る。
   # 同名の tmux セッションに手で作った pane や無関係なシェルへキーを送らないため
   local rows
-  rows=$(tmux list-panes -s -t "=$TMUX_SESSION" -F '#{pane_pid} #{pane_dead} #{pane_id} #{@rc_sid} #{window_name}')
+  # 区切りはタブにする。スペース区切りだと @rc_sid が空の pane（＝restore 以外が作った pane）で
+  # 列が詰まり、window_name が pane_sid に入って「restore が作った pane」と誤判定される
+  rows=$(tmux list-panes -s -t "=$TMUX_SESSION" -F '#{pane_pid}'$'\t''#{pane_dead}'$'\t''#{pane_id}'$'\t''#{@rc_sid}'$'\t''#{window_name}')
   if [[ -z "$rows" ]]; then
     err "tmux セッション '$TMUX_SESSION' に pane がありません"
     return 1
   fi
 
   typeset -A id_of win_of
-  local -a live_pids target_entries
-  local pane_pid pane_dead pane_id pane_sid win_name st sid n_connected=0 n_missing=0 n_dead=0 n_foreign=0 sent=0 rc=0
+  local -a live_pids target_entries pf
+  local pane_pid pane_dead pane_id pane_sid win_name line st sid n_connected=0 n_missing=0 n_dead=0 n_foreign=0 sent=0 rc=0
   live_pids=()
   target_entries=()
-  print -r -- "$rows" | while read -r pane_pid pane_dead pane_id pane_sid win_name; do
+  # IFS=$'\t' read はタブも「IFS の空白」として連続分を畳むため、@rc_sid が空の行で
+  # 列がずれる。列を保つために (@ps:\t:) で明示的に分割する
+  print -r -- "$rows" | while IFS= read -r line; do
+    eval 'pf=("${(@ps:\t:)line}")'
+    pane_pid="${pf[1]:-}"; pane_dead="${pf[2]:-}"; pane_id="${pf[3]:-}"
+    pane_sid="${pf[4]:-}"; win_name="${pf[5]:-}"
+    [[ -z "$pane_pid" ]] && continue
     if [[ -z "$pane_sid" ]]; then
       # restore 以外が作った pane（v1.6 以前の restore で作った pane もここに入る）
       (( n_foreign++ )) || true
@@ -2207,6 +2473,9 @@ EXIT STATUS (restore / switch):
 RECOVER OPTIONS:
   --within <hours>     この時間内に更新された会話ログを対象にする（既定: $RECOVER_HOURS）
   --auto-confirm       起動後の確認ダイアログ（trust / Resume from summary）に Enter を自動送信
+                       （trust 確認への Enter はプロジェクト設定・権限の承認そのものなので、
+                         このフラグを付けない限り自動送信せずダイアログ待ちとして報告する。
+                         restore にこのフラグは無く、trust 確認は常に人間に返す）
   --recap              RC 登録できた会話に要約依頼を 1 通送る（既定）
   --no-recap           要約依頼を送らない
   --limit <N>          起動する復元候補の上限（既定: $MAX_SESSIONS。0 で無制限）
@@ -2227,7 +2496,7 @@ PRUNE OPTIONS:
 ENVIRONMENT:
   CLAUDE_RC_MANIFEST       manifest の保存先（既定: $STATE_DIR/manifest.tsv）
   CLAUDE_RC_TMUX_SESSION   復帰先の tmux セッション名（既定: rc-restore）
-  CLAUDE_RC_CLAUDE_ARGS    restore 時に claude コマンドへ追加するオプション
+  CLAUDE_RC_CLAUDE_ARGS    restore / recover 時に claude コマンドへ追加するオプション
                            （例: "--dangerously-skip-permissions"）
                            権限モードを指定した場合は自動引き継ぎより優先される
   CLAUDE_RC_MAX_AGE_DAYS   最終チャットからこの日数を超えた会話を restore で skip する
