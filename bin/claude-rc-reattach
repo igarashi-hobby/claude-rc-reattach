@@ -26,7 +26,7 @@ VERIFY_TIMEOUT="${CLAUDE_RC_VERIFY_TIMEOUT:-60}"
 STAGGER_SECS="${CLAUDE_RC_STAGGER_SECS:-3}"
 RECOVER_HOURS="${CLAUDE_RC_RECOVER_HOURS:-6}"
 CONFIRM_WAIT="${CLAUDE_RC_CONFIRM_WAIT:-10}"
-MAX_SESSIONS="${CLAUDE_RC_MAX_SESSIONS:-10}"
+MAX_SESSIONS="${CLAUDE_RC_MAX_SESSIONS:-15}"
 WAVE_SIZE="${CLAUDE_RC_WAVE_SIZE:-3}"
 CONFIRM_PENDING=0   # handle_confirm_dialogs の結果（ダイアログ待ちの pane 数）
 RESUME_MODE="as-is"
@@ -60,12 +60,12 @@ if [[ ! "$RECOVER_HOURS" =~ ^[0-9]+$ ]]; then
   RECOVER_HOURS=6
 fi
 if [[ ! "$CONFIRM_WAIT" =~ ^[0-9]+$ ]]; then
-  warn "CLAUDE_RC_CONFIRM_WAIT='$CONFIRM_WAIT' は数値ではないため既定値 10 を使います"
+  warn "CLAUDE_RC_CONFIRM_WAIT='$CONFIRM_WAIT' は数値ではないため既定値 15 を使います"
   CONFIRM_WAIT=10
 fi
 if [[ ! "$MAX_SESSIONS" =~ ^[0-9]+$ ]]; then
-  warn "CLAUDE_RC_MAX_SESSIONS='$MAX_SESSIONS' は数値ではないため既定値 10 を使います"
-  MAX_SESSIONS=10
+  warn "CLAUDE_RC_MAX_SESSIONS='$MAX_SESSIONS' は数値ではないため既定値 15 を使います"
+  MAX_SESSIONS=15
 fi
 if [[ ! "$WAVE_SIZE" =~ ^[0-9]+$ ]]; then
   warn "CLAUDE_RC_WAVE_SIZE='$WAVE_SIZE' は数値ではないため既定値 3 を使います"
@@ -2242,7 +2242,7 @@ ENVIRONMENT:
                              10行以内で要約して表示してください。）
   CLAUDE_RC_RECOVER_HOURS  recover の既定の対象時間（既定: 6。--within で上書き）
   CLAUDE_RC_CONFIRM_WAIT   recover で確認ダイアログを見に行くまでの待ち秒数（既定: 10）
-  CLAUDE_RC_MAX_SESSIONS   restore / recover で起動する復元候補の既定上限（既定: 10。0 で無制限）
+  CLAUDE_RC_MAX_SESSIONS   restore / recover で起動する復元候補の既定上限（既定: 15。0 で無制限）
   CLAUDE_RC_WAVE_SIZE      restore / recover で一度に起動する件数（既定: 3。0 で一括起動）
 EOF
 }

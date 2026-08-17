@@ -327,7 +327,7 @@ $ claude-rc-reattach recover --dry-run
 
 **確認ダイアログについて**:
 recover は manifest 経由ではないため、起動後に trust 確認（`Do you trust the files in this folder?`）や「Resume from summary」のダイアログで止まることがあります。
-起動から少し待って（既定 10 秒 / `CLAUDE_RC_CONFIRM_WAIT`）各ウィンドウを覗き、ダイアログが出ていれば件数を表示します:
+起動から少し待って（既定 15 秒 / `CLAUDE_RC_CONFIRM_WAIT`）各ウィンドウを覗き、ダイアログが出ていれば件数を表示します:
 
 ```
 ⚠ 2 個のセッションが確認ダイアログ待ちです。--auto-confirm で自動応答できます
