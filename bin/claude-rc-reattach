@@ -15,6 +15,7 @@ set -o pipefail
 VERSION="1.7.0"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/claude-rc-reattach"
 MANIFEST="${CLAUDE_RC_MANIFEST:-$STATE_DIR/manifest.tsv}"
+RECAP_DIR="$STATE_DIR/recaps"
 TMUX_SESSION="${CLAUDE_RC_TMUX_SESSION:-rc-restore}"
 SESSIONS_DIR="$HOME/.claude/sessions"
 PROJECTS_DIR="$HOME/.claude/projects"
@@ -35,9 +36,9 @@ CONFIRM_DIALOG_ENTRIES=()
 # trust 系ダイアログ（プロジェクト設定・権限の無確認適用 / managed settings 承認）への
 # Enter は「承認」そのものなので、--auto-confirm を明示した recover 以外では 0 のままにする
 CONFIRM_AUTO=0
-# recap で送るプロンプト。復帰後の RC セッションには切り替え前の履歴が送られない
+# 旧 recap で送るプロンプト。復帰後の RC セッションには切り替え前の履歴が送られない
 # （Claude Code のクロスアカウント抑止）ため、要約を 1 通送って文脈をリモートに残す。
-# 送信後すぐ Enter を打つので、必ず 1 行で書くこと
+# 推論が発生するため現在は --recap 明示時だけ使う。送信後すぐ Enter を打つので必ず 1 行で書くこと
 RECAP_PROMPT="${CLAUDE_RC_RECAP_PROMPT:-アカウント切替で画面上の履歴が空になっています。これまでの会話の経緯・決定事項・いま取り組んでいる作業を10行以内で要約して表示してください。}"
 
 err()  { print -u2 -- "✖ $*"; }
@@ -681,6 +682,253 @@ sys.exit(1)
 PY
 }
 
+file_hash() {
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" 2>/dev/null | awk '{print $1}'
+  else
+    cksum "$1" 2>/dev/null | awk '{print $1 "-" $2}'
+  fi
+}
+
+# 会話ログから「実際の会話ターン」だけを抽出する。
+# system / attachment / tool_result / メタ行は type と message.content で落とす。
+extract_conversation_turns() {
+  local transcript="$1" start_line="${2:-0}"
+  if command -v jq >/dev/null 2>&1; then
+    awk -v start="$start_line" 'NR > start { print }' "$transcript" | jq -R -r '
+      fromjson?
+      | select((.type == "user" or .type == "assistant") and (.message.content != null))
+      | .type as $role
+      | .message.content as $content
+      | (if ($content | type) == "string" then
+           $content
+         elif ($content | type) == "array" then
+           ([$content[]? | select(type == "object" and (.text | type) == "string") | .text] | join("\n"))
+         else
+           ""
+         end) as $text
+      | select($text | length > 0)
+      | "【\($role)】\n\($text)\n"
+    '
+  else
+    python3 - "$transcript" "$start_line" <<'PY'
+import json, sys
+path, start = sys.argv[1], int(sys.argv[2])
+try:
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for lineno, line in enumerate(f, 1):
+            if lineno <= start:
+                continue
+            try:
+                d = json.loads(line)
+            except Exception:
+                continue
+            role = d.get("type")
+            if role not in ("user", "assistant"):
+                continue
+            c = d.get("message", {}).get("content")
+            if isinstance(c, str):
+                text = c
+            elif isinstance(c, list):
+                text = "\n".join(p.get("text", "") for p in c if isinstance(p, dict) and isinstance(p.get("text"), str))
+            else:
+                text = ""
+            if text:
+                print(f"【{role}】\n{text}\n")
+except OSError:
+    sys.exit(1)
+PY
+  fi
+}
+
+write_recap_fallback() {
+  local transcript="$1" out="$2" label="$3"
+  python3 - "$transcript" "$out" "$label" <<'PY'
+import json, sys
+from datetime import datetime
+
+path, out, label = sys.argv[1], sys.argv[2], sys.argv[3]
+last = {"user": "", "assistant": ""}
+
+def text_of(c):
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        return "\n".join(p.get("text", "") for p in c if isinstance(p, dict) and isinstance(p.get("text"), str))
+    return ""
+
+try:
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            try:
+                d = json.loads(line)
+            except Exception:
+                continue
+            role = d.get("type")
+            if role not in last:
+                continue
+            text = " ".join(text_of(d.get("message", {}).get("content")).split())
+            if text:
+                last[role] = text[:200]
+except OSError:
+    pass
+
+with open(out, "w", encoding="utf-8") as f:
+    f.write(f"# {label or '無名セッション'}\n")
+    f.write(f"- 生成日時: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+    f.write("- 生成方式: 要約失敗時の無推論フォールバック\n")
+    f.write(f"- 最後のユーザー発言: {last['user'] or '取得できませんでした'}\n")
+    f.write(f"- 最後のアシスタント発言: {last['assistant'] or '取得できませんでした'}\n")
+PY
+}
+
+generate_recap_for_entry() {
+  local sid="$1" cwd="$2" label="$3" transcript line_count hash prev_line prev_hash start_line
+  local recap_path state_path tmp_new tmp_ctx tmp_out turn_count prompt py_rc
+  [[ -n "$sid" ]] || return 0
+  if ! transcript=$(find_transcript "$cwd" "$sid" 2>/dev/null); then
+    warn "あらすじ更新不可: ${label:-$sid}（会話ログが見つかりません）"
+    return 0
+  fi
+  mkdir -p "$RECAP_DIR" 2>/dev/null || { warn "あらすじ保存先を作成できません: $RECAP_DIR"; return 0; }
+  chmod 700 "$RECAP_DIR" 2>/dev/null || true
+
+  recap_path="$RECAP_DIR/$sid.md"
+  state_path="$RECAP_DIR/$sid.state"
+  line_count=$(wc -l < "$transcript" 2>/dev/null | tr -d ' ') || line_count=0
+  hash=$(file_hash "$transcript")
+  prev_line=0
+  prev_hash=""
+  if [[ -f "$state_path" ]]; then
+    IFS=$'\t' read -r prev_line prev_hash < "$state_path" || true
+    [[ "$prev_line" =~ ^[0-9]+$ ]] || prev_line=0
+  fi
+  if [[ "$prev_line" == "$line_count" && "$prev_hash" == "$hash" && -f "$recap_path" ]]; then
+    print -- "変更なし: ${label:-$sid}"
+    return 0
+  fi
+  start_line="$prev_line"
+  if [[ "$prev_hash" != "$hash" && "$line_count" -le "$prev_line" ]]; then
+    start_line=0
+  fi
+
+  tmp_new=$(mktemp "$RECAP_DIR/.turns.XXXXXX") || return 0
+  tmp_ctx=$(mktemp "$RECAP_DIR/.ctx.XXXXXX") || { rm -f "$tmp_new"; return 0; }
+  tmp_out=$(mktemp "$RECAP_DIR/.out.XXXXXX") || { rm -f "$tmp_new" "$tmp_ctx"; return 0; }
+  extract_conversation_turns "$transcript" "$start_line" > "$tmp_new" 2>/dev/null || true
+  turn_count=$(grep -c '^【\(user\|assistant\)】' "$tmp_new" 2>/dev/null || true)
+  [[ "$turn_count" =~ ^[0-9]+$ ]] || turn_count=0
+  if (( turn_count == 0 )) && [[ -f "$recap_path" ]]; then
+    printf '%s\t%s\n' "$line_count" "$hash" > "$state_path" 2>/dev/null || true
+    print -- "変更なし: ${label:-$sid}"
+    rm -f "$tmp_new" "$tmp_ctx" "$tmp_out"
+    return 0
+  fi
+
+  {
+    [[ -f "$recap_path" ]] && cat "$recap_path"
+    print
+    tail -c 8000 "$tmp_new" 2>/dev/null
+  } > "$tmp_ctx"
+  print -- "あらすじ更新: ${label:-$sid} (差分${turn_count}ターン)"
+  prompt="この会話の (1)決定済み事項 (2)作業中のこと (3)未解決・次にやること (4)最後の指示 を合計10行以内の日本語で"
+  python3 - "$tmp_ctx" "$tmp_out" "$prompt" "${CLAUDE_RC_RECAP_MODEL:-haiku}" <<'PY'
+import subprocess, sys
+ctx, out, prompt = sys.argv[1], sys.argv[2], sys.argv[3]
+recap_model = sys.argv[4] if len(sys.argv) > 4 else "haiku"
+try:
+    body = open(ctx, encoding="utf-8", errors="replace").read()
+    res = subprocess.run(
+        ["claude", "-p", "--model", recap_model, prompt + "\n\n" + body],
+        text=True,
+        capture_output=True,
+        timeout=60,
+    )
+    text = res.stdout.strip()
+    if res.returncode != 0 or not text:
+        sys.exit(1)
+    with open(out, "w", encoding="utf-8") as f:
+        f.write(text + "\n")
+except Exception:
+    sys.exit(1)
+PY
+  py_rc=$?
+  if (( py_rc == 0 )); then
+    mv -f "$tmp_out" "$recap_path" 2>/dev/null || write_recap_fallback "$transcript" "$recap_path" "${label:-$sid}"
+  else
+    warn "${label:-$sid}: あらすじ生成に失敗したためフォールバックを保存します"
+    write_recap_fallback "$transcript" "$recap_path" "${label:-$sid}" || true
+  fi
+  printf '%s\t%s\n' "$line_count" "$hash" > "$state_path" 2>/dev/null || true
+  rm -f "$tmp_new" "$tmp_ctx" "$tmp_out"
+  return 0
+}
+
+update_recaps_from_manifest_rows() {
+  local rows="$1" line sid cwd name label
+  local -a f
+  [[ -n "$rows" ]] || return 0
+  print
+  print -- "── あらすじの事前生成 ──"
+  print -r -- "$rows" | while IFS= read -r line; do
+    eval 'f=("${(@ps:\t:)line}")'
+    sid="${f[1]:-}"; cwd="${f[2]:-}"; name="${f[3]:-}"
+    [[ -z "$sid" ]] && continue
+    label="${name:-$sid}"
+    generate_recap_for_entry "$sid" "$cwd" "$label" || true
+  done
+}
+
+display_recap_entries() {
+  local entries="$1" title="${2:-保存済みあらすじ}" line sid label recap_file body
+  [[ -n "$entries" ]] || return 0
+  print
+  print -- "── $title ──"
+  print -r -- "$entries" | while IFS=$'\t' read -r sid label; do
+    [[ -z "$sid" ]] && continue
+    recap_file="$RECAP_DIR/$sid.md"
+    print -- "### ${label:-$sid}"
+    if [[ -f "$recap_file" ]]; then
+      body=$(sed '/^[[:space:]]*$/d' "$recap_file" 2>/dev/null)
+      if [[ -n "$body" ]]; then
+        print -r -- "$body" | sed 's/^/  /'
+      else
+        info "（あらすじは空です）"
+      fi
+    else
+      info "（あらすじ未作成: 先に save を実行してください）"
+    fi
+    print
+  done
+}
+
+cmd_digest() {
+  local filter="${1:-}" line sid cwd name label rows=""
+  local -a f
+  if (( $# > 1 )); then
+    err "digest の引数は名前フィルタ 1 つまでです"
+    return 1
+  fi
+  if [[ ! -f "$MANIFEST" ]]; then
+    err "manifest がありません: $MANIFEST"
+    return 1
+  fi
+  while IFS= read -r line; do
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    eval 'f=("${(@ps:\t:)line}")'
+    sid="${f[1]:-}"; name="${f[3]:-}"
+    [[ -z "$sid" ]] && continue
+    label="${name:-$sid}"
+    [[ -n "$filter" && "$label" != *"$filter"* ]] && continue
+    rows+="${sid}"$'\t'"${label}"$'\n'
+  done < "$MANIFEST"
+  if [[ -z "$rows" ]]; then
+    info "該当する manifest 行はありません"
+    return 0
+  fi
+  display_recap_entries "$rows" "digest"
+}
+
 # 空名 / UUID 風 / Claude 自動名なら、会話本文や cwd から復元名を作る
 fallback_session_base_name() {
   local name="$1" transcript="$2" cwd="$3"
@@ -1128,10 +1376,11 @@ cmd_save() {
       info "• ${name:-(無名)}  [$cwd]"
     fi
   done
+  update_recaps_from_manifest_rows "$rows_ext" || true
 }
 
 cmd_restore() {
-  local fork=1 dry=0 inherit_perms=1 force=0 rename=1 recap=1 inherit_bypass=0 yes=0 limit="$MAX_SESSIONS" pick=0 wave_size="$WAVE_SIZE"
+  local fork=1 dry=0 inherit_perms=1 force=0 rename=1 recap=0 inherit_bypass=0 yes=0 limit="$MAX_SESSIONS" pick=0 wave_size="$WAVE_SIZE"
   RESUME_MODE="as-is"
   # restore に --auto-confirm は無い。trust 確認は自動承認せず人間に返す
   CONFIRM_AUTO=0
@@ -1146,7 +1395,7 @@ cmd_restore() {
       --no-inherit-perms) inherit_perms=0 ;;
       --inherit-bypass)   inherit_bypass=1 ;;
       --recap)   recap=1 ;;
-      --no-recap) recap=0 ;;
+      --no-recap) recap=0 ;;  # 互換用。既定OFFなので指定されても動作は変わらない
       --pick)    pick=1 ;;
       --limit)
         shift
@@ -1364,8 +1613,8 @@ cmd_restore() {
   # limit 適用前に落とした分も skip 件数に含める（完了行の集計を実態と合わせるため）
   local resumed=0 skipped=$skipped_pre now
   now=$(date +%s)
-  local sid cwd name opid perm label restored_name rc_name transcript win cmd_str last_epoch age_days pane_info pane_id pane_pid line sort_epoch sort_label wave_rc unregistered
-  local -a claude_cmd perm_args v_entries d_entries wave_v_entries wave_d_entries f
+  local sid cwd name opid perm label restored_name rc_name transcript win cmd_str last_epoch age_days pane_info pane_id pane_pid line sort_epoch sort_label wave_rc unregistered recap_rows
+  local -a claude_cmd perm_args v_entries d_entries wave_v_entries wave_d_entries recap_entries f
   # 同じ会話を 2 回起動すると 1 本の会話ログに両方が書き込まれるため、実行内でも重複を弾く
   # （古いバージョンが書いた manifest や手で編集した manifest に重複が残っていることがある）
   typeset -A seen_sids
@@ -1373,6 +1622,7 @@ cmd_restore() {
   d_entries=()
   wave_v_entries=()
   wave_d_entries=()
+  recap_entries=()
   local wave_failed=0 aborted=0
   while IFS=$'\t' read -r sort_epoch sort_label line; do
     [[ -z "$line" ]] && continue
@@ -1513,6 +1763,7 @@ cmd_restore() {
     d_entries+=("${pane_id}"$'\t'"$label")
     wave_v_entries+=("${pane_pid}"$'\t'"$label")
     wave_d_entries+=("${pane_id}"$'\t'"$label")
+    recap_entries+=("${sid}"$'\t'"$label")
     ok "$label: 起動しました（tmux window: $win）"
     (( resumed++ )) || true
     if (( VERIFY_TIMEOUT > 0 && wave_size > 0 && ${#wave_v_entries} >= wave_size )); then
@@ -1621,10 +1872,13 @@ cmd_restore() {
   # ローカルの会話は継続しているので、期待とのズレを必ず伝える
   print
   info "※ リモート側には切り替え前の履歴は表示されません（Claude Code の仕様。ローカルの会話は継続しています）"
+  eval 'recap_rows="${(F)recap_entries}"'
+  display_recap_entries "$recap_rows" "復元セッションのあらすじ"
   if (( recap )); then
+    warn "--recap は旧方式です（トークン消費大・非推奨）。RC セッションへ要約依頼を送信します"
     send_recap "${v_entries[@]}" || true
   else
-    info "  --no-recap 指定のため、要約送信は行いません"
+    info "  要約依頼の自動送信は行いません（--recap 明示時のみ旧方式で送信）"
   fi
   report_limit_remainder "$remainder_rows" restore
   return $rc
@@ -1633,7 +1887,7 @@ cmd_restore() {
 # manifest 無しで復旧するモード（save する前にクラッシュ／強制終了した場合の受け皿）
 #   ~/.claude/projects/ の会話ログから「直近に更新された & いま動いていない」ものを拾って resume する
 cmd_recover() {
-  local dry=0 auto_confirm=0 rename=1 recap=1 hours="$RECOVER_HOURS" yes=0 limit="$MAX_SESSIONS" pick=0 wave_size="$WAVE_SIZE"
+  local dry=0 auto_confirm=0 rename=1 recap=0 hours="$RECOVER_HOURS" yes=0 limit="$MAX_SESSIONS" pick=0 wave_size="$WAVE_SIZE"
   RESUME_MODE="as-is"
   while (( $# )); do
     case "$1" in
@@ -1647,7 +1901,7 @@ cmd_recover() {
       --dry-run)      dry=1 ;;
       --yes)          yes=1 ;;
       --recap)        recap=1 ;;
-      --no-recap)     recap=0 ;;
+      --no-recap)     recap=0 ;;  # 互換用。既定OFFなので指定されても動作は変わらない
       --pick)         pick=1 ;;
       --auto-confirm) auto_confirm=1 ;;
       --no-rename)    rename=0 ;;
@@ -1745,7 +1999,7 @@ cmd_recover() {
 
   # RC は起動時に明示する。settings.json の remoteControlAtStartup 頼みだと、
   # 設定が無い / 効いていない環境では波ごとに VERIFY_TIMEOUT 秒待たされ、
-  # 最後は ⚠ + reconnect 送りになり recap も 1 通も飛ばない（restore と同じ理由）。
+  # 最後は ⚠ + reconnect 送りになり、あらすじ表示の前提となる RC 確認も失敗する（restore と同じ理由）。
   # 環境変数側で既に指定されている場合は二重指定しない
   local rc_flag=1
   [[ "${claude_extra[*]}" == *--remote-control* ]] && rc_flag=0
@@ -1753,14 +2007,15 @@ cmd_recover() {
   print -- "復旧候補（直近 ${hours} 時間・実行中のものを除く）:"
   # 注意: zsh ではループ内で `local` を再宣言すると変数の中身が出力されるため、
   # ループで使う変数はここでまとめて宣言する
-  local when sid cwd proj title label win cmd_str pane_info pane_id pane_pid last_proj="" transcript wave_rc unregistered
+  local when sid cwd proj title label win cmd_str pane_info pane_id pane_pid last_proj="" transcript wave_rc unregistered recap_rows
   local restored_name rc_name
   local recovered=0 skipped=0
-  local -a claude_cmd v_entries d_entries wave_v_entries wave_d_entries
+  local -a claude_cmd v_entries d_entries wave_v_entries wave_d_entries recap_entries
   v_entries=()
   d_entries=()
   wave_v_entries=()
   wave_d_entries=()
+  recap_entries=()
   local wave_failed=0 aborted=0
   while IFS=$'\t' read -r when sid cwd proj title; do
     [[ -z "$sid" ]] && continue
@@ -1820,6 +2075,7 @@ cmd_recover() {
     d_entries+=("${pane_id}"$'\t'"$label")
     wave_v_entries+=("${pane_pid}"$'\t'"$label")
     wave_d_entries+=("${pane_id}"$'\t'"$label")
+    recap_entries+=("${sid}"$'\t'"$label")
     ok "$label: 起動しました（tmux window: $win）"
     (( recovered++ )) || true
     if (( VERIFY_TIMEOUT > 0 && wave_size > 0 && ${#wave_v_entries} >= wave_size )); then
@@ -1870,7 +2126,7 @@ cmd_recover() {
   # restore と違い trust ダイアログや「Resume from summary」で止まることがある
   # （manifest 経由でないぶん、最後に開いた状態が読めないため）
   #   ここで return してしまうと、既に RC 接続できている他のセッションまで
-  #   RC 登録確認と recap を丸ごと落とす（1 件のダイアログ待ちで全件が要約なしになる）。
+  #   RC 登録確認とあらすじ表示を丸ごと落とす。
   #   ダイアログ待ちは終了コードにだけ反映し、処理は最後まで進める
   local rc=0
   if (( wave_size == 0 || VERIFY_TIMEOUT == 0 || ${#wave_d_entries} > 0 )); then
@@ -1884,7 +2140,7 @@ cmd_recover() {
       print
       warn "${CONFIRM_PENDING} 個のセッションが確認ダイアログ待ちです。--auto-confirm で自動応答できます"
       info "（または tmux attach -t $TMUX_SESSION でウィンドウを開き、手動で Enter）"
-      info "ダイアログ待ち以外の会話は、このまま RC 登録確認と要約送信まで進めます"
+      info "ダイアログ待ち以外の会話は、このまま RC 登録確認とあらすじ表示まで進めます"
       rc=1
     fi
   fi
@@ -1942,10 +2198,13 @@ cmd_recover() {
     fi
     print
     info "※ リモート側には復旧前の履歴が表示されないことがあります（ローカルの会話は継続しています）"
+    eval 'recap_rows="${(F)recap_entries}"'
+    display_recap_entries "$recap_rows" "復旧セッションのあらすじ"
     if (( recap )); then
+      warn "--recap は旧方式です（トークン消費大・非推奨）。RC セッションへ要約依頼を送信します"
       send_recap "${v_entries[@]}" || true
     else
-      info "  --no-recap 指定のため、要約送信は行いません"
+      info "  要約依頼の自動送信は行いません（--recap 明示時のみ旧方式で送信）"
     fi
     report_limit_remainder "$remainder_rows" recover
     return $rc
@@ -1953,7 +2212,9 @@ cmd_recover() {
     print
     info "確認方法:"
     info "  tmux attach -t $TMUX_SESSION     # 各ウィンドウのフッターに /rc active が出ていれば成功"
-    info "  --no-recap を付けていない場合も、RC 登録確認を無効化しているため要約は自動送信しません"
+    eval 'recap_rows="${(F)recap_entries}"'
+    display_recap_entries "$recap_rows" "復旧セッションのあらすじ"
+    info "  要約依頼の自動送信は行いません（--recap 明示時のみ旧方式で送信）"
     report_limit_remainder "$remainder_rows" recover
     return $rc
   fi
@@ -2437,6 +2698,7 @@ COMMANDS:
   restore [options]  manifest の会話を tmux 内で resume して RC 再登録（切り替え「後」に実行）
   switch  [options]  save → logout → login → restore を一括実行
   recover [options]  manifest 無しで、直近に更新された会話ログから復旧（クラッシュ後の受け皿）
+  digest [filter]    manifest の保存済みあらすじをまとめて表示（名前フィルタ可）
   prune [options]    復元用 tmux セッション内の古い pane を正常終了して片付ける
   reconnect [--recap] tmux 内の RC 未登録セッションに /remote-control を送信して再接続
   help               このヘルプを表示
@@ -2451,10 +2713,9 @@ RESTORE/SWITCH OPTIONS:
   --inherit-bypass     bypass 系の権限モードも引き継ぐ
                        （--dangerously-skip-permissions / --permission-mode bypassPermissions。
                          既定では引き継がない。ps からの検出は誤検出し得るため）
-  --recap              RC 登録できた会話に要約依頼を 1 通送る（既定）
-  --no-recap           要約依頼を送らない
-                       （切り替え前の履歴はリモートに送られないため、既定では要約で文脈を残す。
-                         入力欄は空にしておくこと）
+  --recap              旧方式: RC 登録できた会話に要約依頼を 1 通送る
+                       （トークン消費大・非推奨。既定では送らず、save 済みあらすじを表示）
+  --no-recap           互換用。既定OFFのため指定しても動作は変わらない
   --limit <N>          起動する復元候補の上限（既定: $MAX_SESSIONS。0 で無制限）
   --pick               復元候補を番号付き一覧から対話選択する
   --wave-size <N>      N 件ずつ起動して RC 登録確認後に次の波へ進む
@@ -2476,8 +2737,9 @@ RECOVER OPTIONS:
                        （trust 確認への Enter はプロジェクト設定・権限の承認そのものなので、
                          このフラグを付けない限り自動送信せずダイアログ待ちとして報告する。
                          restore にこのフラグは無く、trust 確認は常に人間に返す）
-  --recap              RC 登録できた会話に要約依頼を 1 通送る（既定）
-  --no-recap           要約依頼を送らない
+  --recap              旧方式: RC 登録できた会話に要約依頼を 1 通送る
+                       （トークン消費大・非推奨。既定では送らず、保存済みあらすじを表示）
+  --no-recap           互換用。既定OFFのため指定しても動作は変わらない
   --limit <N>          起動する復元候補の上限（既定: $MAX_SESSIONS。0 で無制限）
   --pick               復元候補を番号付き一覧から対話選択する
   --wave-size <N>      N 件ずつ起動して RC 登録確認後に次の波へ進む
@@ -2505,7 +2767,7 @@ ENVIRONMENT:
                            （既定: 60。0 で確認しない）
   CLAUDE_RC_STAGGER_SECS   restore で各セッションを起動する間隔の秒数
                            （既定: 3。credential の同時発行・同時失効の緩和用。0 で無効化）
-  CLAUDE_RC_RECAP_PROMPT   recap で送るプロンプト（必ず 1 行で書くこと）
+  CLAUDE_RC_RECAP_PROMPT   旧方式 --recap で送るプロンプト（必ず 1 行で書くこと）
                            （既定: アカウント切替で画面上の履歴が空になっています。
                              これまでの会話の経緯・決定事項・いま取り組んでいる作業を
                              10行以内で要約して表示してください。）
@@ -2522,6 +2784,7 @@ case "${1:-help}" in
   restore)   shift; cmd_restore "$@" ;;
   switch)    shift; cmd_switch "$@" ;;
   recover)   shift; cmd_recover "$@" ;;
+  digest)    shift; cmd_digest "$@" ;;
   prune)     shift; cmd_prune "$@" ;;
   reconnect) shift; cmd_reconnect "$@" ;;
   -h|--help|help) usage ;;
